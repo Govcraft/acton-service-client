@@ -1,0 +1,24 @@
+[package]
+name = "acton-service-client"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Typed async HTTP client for services built on the acton-service framework. Encodes acton-service's fixed wire conventions (error bodies, versioned routes, health/readiness, request-tracking headers, rate limiting) so consumers don't reinvent them."
+repository = "https://github.com/Govcraft/acton-service-client"
+homepage = "https://github.com/Govcraft/acton-service-client"
+readme = "README.md"
+keywords = ["http", "client", "reqwest", "api", "acton-service"]
+categories = ["web-programming::http-client", "network-programming", "asynchronous"]
+
+[dependencies]
+reqwest = { version = "0.13.4", default-features = false, features = ["rustls", "json", "query"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+thiserror = "2.0.18"
+tokio = { version = "1.52.3", features = ["time"] }
+url = "2.5.8"
+uuid = { version = "1.23.4", features = ["v4"] }
+
+[dev-dependencies]
+axum = "0.8.9"
+tokio = { version = "1.52.3", features = ["full"] }
