@@ -1,6 +1,6 @@
 [package]
 name = "acton-service-client"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 license = "MIT"
 description = "Typed async HTTP client for services built on the acton-service framework. Encodes acton-service's fixed wire conventions (error bodies, versioned routes, health/readiness, request-tracking headers, rate limiting) so consumers don't reinvent them."

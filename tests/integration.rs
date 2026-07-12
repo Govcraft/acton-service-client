@@ -24,6 +24,7 @@ use acton_service_client::{
     ApiVersion, ClientError, DependencyStatus, HealthResponse, ReadinessResponse, RequestContext,
     RetryPolicy, ServiceClient, StatusCode,
 };
+use axum::body::Bytes;
 use axum::extract::Path;
 use axum::http::{HeaderMap, StatusCode as AxumStatus, header};
 use axum::response::{IntoResponse, Response};
@@ -48,10 +49,33 @@ fn app() -> Router {
         .route("/api/v1/users/{id}", delete(delete_user))
         .route("/api/v1/users", post(create_user))
         .route("/api/v1/echo-headers", get(echo_headers))
+        .route("/api/v1/echo-body", post(echo_body))
         .route("/api/v1/rate-limited", get(rate_limited))
         .route("/api/v1/locked", get(locked))
         .route("/api/v1/broken", get(broken))
         .route("/api/v1/missing", get(not_found))
+}
+
+/// Echoes the raw request body back, along with the `Content-Type` it arrived with.
+///
+/// Takes [`Bytes`], not a `Json<…>` and not even a `String`: the point is to observe
+/// the bytes exactly as they were sent, without a body extractor getting a chance to
+/// reinterpret — or reject — them. A `String` extractor would 400 on a body that is
+/// not valid UTF-8, which is precisely the binary case worth proving.
+///
+/// `body` is the UTF-8 view (for the text cases) and `bytes` the raw octets (for the
+/// binary one).
+async fn echo_body(headers: HeaderMap, body: Bytes) -> Json<serde_json::Value> {
+    let content_type = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_owned();
+    Json(json!({
+        "body": String::from_utf8_lossy(&body),
+        "bytes": body.to_vec(),
+        "content_type": content_type,
+    }))
 }
 
 async fn health() -> Json<serde_json::Value> {
@@ -375,4 +399,154 @@ async fn decode_error_when_body_mismatches_type() {
         .await
         .unwrap_err();
     assert!(matches!(err, ClientError::Decode { .. }));
+}
+
+/// A CSV upload: newlines and quotes, exactly the characters JSON encoding mangles.
+const CSV: &str = "id,name\n1,\"Lovelace, Ada\"\n2,Hopper\n";
+
+/// A raw body goes out **verbatim**, with the caller's `Content-Type`.
+///
+/// The case `json` cannot express. An endpoint that takes a document — CSV, plain
+/// text, a pre-rendered payload — needs the bytes it was handed, and `json` would
+/// serialize a `&str` into a *quoted, escaped JSON string*, which is a different
+/// document. Not a hypothetical: it silently turns a valid upload into one the far
+/// end cannot parse.
+#[tokio::test]
+async fn body_sends_raw_bytes_verbatim_with_the_given_content_type() {
+    let base = spawn_server().await;
+
+    let echoed: serde_json::Value = client(&base)
+        .request(acton_service_client::Method::POST, "echo-body")
+        .body(CSV, "text/csv; charset=utf-8")
+        .unwrap()
+        .send_json()
+        .await
+        .unwrap();
+
+    assert_eq!(
+        echoed["body"], CSV,
+        "the bytes must arrive exactly as handed over"
+    );
+    assert_eq!(echoed["content_type"], "text/csv; charset=utf-8");
+}
+
+/// Binary is bytes, not text: a body given as raw octets survives byte-for-byte,
+/// including bytes that are not valid UTF-8 at all.
+#[tokio::test]
+async fn body_accepts_raw_bytes_not_just_text() {
+    let base = spawn_server().await;
+    // A PNG magic number: `0x89` is not valid UTF-8, so nothing may treat this as text.
+    let bytes: Vec<u8> = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+
+    let echoed: serde_json::Value = client(&base)
+        .request(acton_service_client::Method::POST, "echo-body")
+        .body(bytes.clone(), "application/octet-stream")
+        .unwrap()
+        .send_json()
+        .await
+        .unwrap();
+
+    assert_eq!(echoed["content_type"], "application/octet-stream");
+    let received: Vec<u8> = serde_json::from_value(echoed["bytes"].clone()).unwrap();
+    assert_eq!(received, bytes, "every octet survives, UTF-8 or not");
+}
+
+/// The contrast that justifies the method above: `json` on the *same* `&str` sends a
+/// JSON string literal — quoted and escaped — not the document. Both are correct;
+/// they are simply different bodies, and an endpoint taking a document needs the
+/// other one.
+#[tokio::test]
+async fn json_on_a_str_sends_a_quoted_json_string_not_the_raw_document() {
+    let base = spawn_server().await;
+
+    let echoed: serde_json::Value = client(&base)
+        .request(acton_service_client::Method::POST, "echo-body")
+        .json(CSV)
+        .unwrap()
+        .send_json()
+        .await
+        .unwrap();
+
+    assert_eq!(
+        echoed["body"],
+        serde_json::to_string(CSV).unwrap(),
+        "json encodes the string; it does not pass it through"
+    );
+    assert_ne!(echoed["body"], CSV);
+    assert_eq!(echoed["content_type"], "application/json");
+}
+
+/// The documented precedence: a request carries at most one body, so **the last call
+/// wins** — in either order, and without panicking or merging.
+#[tokio::test]
+async fn the_last_of_json_and_body_to_be_called_wins() {
+    let base = spawn_server().await;
+
+    // body last: the raw document wins, with its content type.
+    let raw_last: serde_json::Value = client(&base)
+        .request(acton_service_client::Method::POST, "echo-body")
+        .json(&User {
+            id: 1,
+            name: "Ada".into(),
+        })
+        .unwrap()
+        .body(CSV, "text/csv")
+        .unwrap()
+        .send_json()
+        .await
+        .unwrap();
+    assert_eq!(raw_last["body"], CSV);
+    assert_eq!(raw_last["content_type"], "text/csv");
+
+    // json last: the JSON wins, and reclaims `application/json`.
+    let json_last: serde_json::Value = client(&base)
+        .request(acton_service_client::Method::POST, "echo-body")
+        .body(CSV, "text/csv")
+        .unwrap()
+        .json(&User {
+            id: 1,
+            name: "Ada".into(),
+        })
+        .unwrap()
+        .send_json()
+        .await
+        .unwrap();
+    assert_eq!(json_last["content_type"], "application/json");
+    assert_eq!(
+        json_last["body"],
+        serde_json::to_string(&User {
+            id: 1,
+            name: "Ada".into()
+        })
+        .unwrap()
+    );
+}
+
+/// It composes with the rest of the chain — query, headers, retriable, accept_status
+/// — in any order, and an explicit `content-type` header set afterwards still wins.
+#[tokio::test]
+async fn body_composes_with_the_rest_of_the_builder_chain() {
+    let base = spawn_server().await;
+
+    let echoed: serde_json::Value = client(&base)
+        .request(acton_service_client::Method::POST, "echo-body")
+        .query("dry_run", "true")
+        .body(CSV, "text/csv")
+        .unwrap()
+        .header("content-type", "text/plain")
+        .unwrap()
+        .retriable(true)
+        .accept_status(StatusCode::CONFLICT)
+        .send_json()
+        .await
+        .unwrap();
+
+    assert_eq!(
+        echoed["body"], CSV,
+        "the body survives the rest of the chain"
+    );
+    assert_eq!(
+        echoed["content_type"], "text/plain",
+        "an explicit header set afterwards wins"
+    );
 }

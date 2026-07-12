@@ -123,6 +123,11 @@ impl RequestBuilder {
 
     /// Serialize `body` as JSON and attach it, setting `Content-Type`.
     ///
+    /// Note that a `&str` becomes a JSON *string literal* (quoted, and with newlines
+    /// and quotes escaped), not the raw text. To send a body verbatim — plain text,
+    /// CSV, bytes — use [`body`](Self::body). Both set the body, and the last call
+    /// wins.
+    ///
     /// # Errors
     ///
     /// Returns [`ClientError::Config`] if `body` cannot be serialized to JSON.
@@ -132,6 +137,63 @@ impl RequestBuilder {
         self.headers
             .insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
         self.body = Some(bytes);
+        Ok(self)
+    }
+
+    /// Attach a raw body verbatim, with an explicit `Content-Type`.
+    ///
+    /// [`json`](Self::json) is the common case and should be preferred. This is for
+    /// the endpoints JSON cannot express: one that takes a `text/plain` document, a
+    /// `text/csv` upload, an `application/octet-stream` blob, an
+    /// `application/x-www-form-urlencoded` form, a pre-rendered payload of any kind.
+    ///
+    /// Such a body is **not** a JSON document, and `json` cannot emit one: given a
+    /// `&str` it produces a *JSON string literal* — quoted, with newlines and quotes
+    /// escaped — which is a different sequence of bytes than the text the caller
+    /// meant to send. Here the bytes go out exactly as given.
+    ///
+    /// # Precedence with [`json`](Self::json)
+    ///
+    /// Both set the body and overwrite `Content-Type`, and **the last call wins**.
+    /// Neither panics and neither merges; calling `.json(&x).body(raw, ct)` sends
+    /// `raw` with `ct`, and calling `.body(raw, ct).json(&x)` sends the JSON with
+    /// `application/json`. A request carries at most one body, so the final call is
+    /// simply the one that describes it.
+    ///
+    /// # Composition
+    ///
+    /// Chains with [`query`](Self::query), [`header`](Self::header),
+    /// [`context`](Self::context), [`retriable`](Self::retriable), and
+    /// [`accept_status`](Self::accept_status) in any order. An explicit
+    /// `.header("content-type", …)` set *after* this call still wins, since it is
+    /// applied to the same header map.
+    ///
+    /// ```no_run
+    /// use acton_service_client::{Method, ServiceClient};
+    /// # async fn run(client: ServiceClient) -> Result<(), acton_service_client::ClientError> {
+    /// let response = client
+    ///     .request(Method::POST, "documents")
+    ///     .body("id,name\n1,Ada\n", "text/csv")?
+    ///     .send()
+    ///     .await?;
+    /// # let _ = response;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError::Config`] if `content_type` is not a valid header
+    /// value.
+    pub fn body(
+        mut self,
+        body: impl Into<Vec<u8>>,
+        content_type: impl AsRef<str>,
+    ) -> Result<Self, ClientError> {
+        let content_type = HeaderValue::from_str(content_type.as_ref())
+            .map_err(|e| ClientError::Config(format!("invalid content type: {e}")))?;
+        self.headers.insert(CONTENT_TYPE, content_type);
+        self.body = Some(body.into());
         Ok(self)
     }
 
