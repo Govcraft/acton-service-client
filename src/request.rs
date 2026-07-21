@@ -219,12 +219,17 @@ impl RequestBuilder {
         build_url(&inner.base_url, &path)
     }
 
-    /// Build the header map sent on every attempt: context (with an ensured
-    /// `x-request-id`) first, then explicitly-set headers on top.
+    /// Build the header map sent on every attempt: the client's default headers
+    /// (bearer token and any `default_header`) as the base, then context (with
+    /// an ensured `x-request-id`), then explicitly-set per-request headers on
+    /// top. Later layers override earlier ones by name.
     fn effective_headers(&self) -> HeaderMap {
+        let mut headers = self.client.inner.default_headers.clone();
         let mut ctx = self.context.clone();
         ctx.ensure_request_id();
-        let mut headers = ctx.to_headers();
+        for (name, value) in &ctx.to_headers() {
+            headers.insert(name.clone(), value.clone());
+        }
         for (name, value) in &self.headers {
             headers.insert(name.clone(), value.clone());
         }
@@ -371,6 +376,32 @@ mod tests {
             .unwrap();
         let h = rb.effective_headers();
         assert_eq!(h.get("x-request-id").unwrap(), "explicit");
+    }
+
+    #[test]
+    fn default_headers_are_applied_per_request() {
+        let c = ServiceClient::builder("https://api.example.com")
+            .bearer_token("secret")
+            .build()
+            .unwrap();
+        let h = c.request(Method::GET, "x").effective_headers();
+        assert_eq!(h.get("authorization").unwrap(), "Bearer secret");
+        // The generated request id still lands alongside the default header.
+        assert!(h.contains_key("x-request-id"));
+    }
+
+    #[test]
+    fn per_request_header_overrides_default_header() {
+        let c = ServiceClient::builder("https://api.example.com")
+            .bearer_token("from-default")
+            .build()
+            .unwrap();
+        let h = c
+            .request(Method::GET, "x")
+            .header("authorization", "Bearer explicit")
+            .unwrap()
+            .effective_headers();
+        assert_eq!(h.get("authorization").unwrap(), "Bearer explicit");
     }
 
     #[test]

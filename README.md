@@ -79,6 +79,33 @@ let page: Page = client
 # }
 ```
 
+### Custom HTTP client (mutual TLS, proxies, pools)
+
+For anything the builder does not surface — a client certificate for mutual
+TLS, a custom root store, a proxy, or a shared connection pool — build a
+`reqwest::Client` and hand it to `with_http_client`. This is how you pair the
+crate with an `acton-service` listener that verifies client certificates: give
+reqwest the client identity, then pass the client in. The `reqwest` crate is
+re-exported at the crate root so the client you build matches the type the
+builder expects.
+
+```rust,no_run
+# use acton_service_client::ServiceClient;
+# fn make_tls_client() -> reqwest::Client { unimplemented!() }
+# fn run() -> Result<(), acton_service_client::ClientError> {
+let mtls: reqwest::Client = make_tls_client();  // use_rustls_tls() + Identity::from_pem(..)
+let client = ServiceClient::builder("https://api.example.com")
+    .bearer_token("token")          // still sent, per-request
+    .with_http_client(mtls)
+    .build()?;
+# let _ = client; Ok(())
+# }
+```
+
+`bearer_token` and `default_header` are sent per-request, so they keep working
+with a supplied client. Only `timeout` is ignored on this path — set it on the
+client you pass in.
+
 ## Error handling
 
 Every fallible call returns `ClientError`:

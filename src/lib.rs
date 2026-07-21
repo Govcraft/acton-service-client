@@ -63,6 +63,17 @@
 //! marked with [`RequestBuilder::retriable`]. A server `Retry-After` is honored
 //! when present; otherwise the delay is computed by
 //! [`RetryPolicy::backoff_delay`].
+//!
+//! # Custom HTTP client (mutual TLS, proxies, pools)
+//!
+//! For anything the builder does not surface — a client certificate for mutual
+//! TLS, a custom root store, a proxy, or a shared connection pool — build a
+//! [`reqwest::Client`] and pass it to
+//! [`ServiceClientBuilder::with_http_client`]. The `reqwest` crate is
+//! re-exported at the crate root so the client you construct matches the type
+//! the builder expects. [`bearer_token`](ServiceClientBuilder::bearer_token)
+//! and [`default_header`](ServiceClientBuilder::default_header) are sent
+//! per-request, so they keep working with a supplied client.
 
 #![deny(missing_docs)]
 #![deny(rustdoc::broken_intra_doc_links)]
@@ -93,3 +104,11 @@ pub use versioning::ApiVersion;
 pub use reqwest::Method;
 /// Re-export of `reqwest`'s `StatusCode` for convenience.
 pub use reqwest::StatusCode;
+
+/// Re-export of the `reqwest` crate.
+///
+/// Build a client against this exact version — with a client certificate, a
+/// custom root store, or a proxy — and hand it to
+/// [`ServiceClientBuilder::with_http_client`] without risking a version
+/// mismatch on the `reqwest::Client` type.
+pub use reqwest;

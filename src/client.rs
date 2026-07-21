@@ -21,6 +21,11 @@ pub(crate) struct Inner {
     pub(crate) base_path: String,
     pub(crate) version: ApiVersion,
     pub(crate) retry: Option<RetryPolicy>,
+    /// Headers applied to every request (bearer token plus any
+    /// [`ServiceClientBuilder::default_header`]). Held here rather than baked
+    /// into the [`reqwest::Client`] so they apply equally to a client supplied
+    /// via [`ServiceClientBuilder::with_http_client`].
+    pub(crate) default_headers: HeaderMap,
 }
 
 /// A typed async HTTP client for services built on `acton-service`.
@@ -190,6 +195,7 @@ pub struct ServiceClientBuilder {
     timeout: Duration,
     retry: Option<RetryPolicy>,
     default_headers: HeaderMap,
+    http_client: Option<reqwest::Client>,
 }
 
 impl ServiceClientBuilder {
@@ -202,6 +208,7 @@ impl ServiceClientBuilder {
             timeout: Duration::from_secs(30),
             retry: None,
             default_headers: HeaderMap::new(),
+            http_client: None,
         }
     }
 
@@ -248,13 +255,54 @@ impl ServiceClientBuilder {
         self
     }
 
+    /// Supply a pre-configured [`reqwest::Client`] instead of letting the
+    /// builder construct one.
+    ///
+    /// This is the escape hatch for any reqwest capability the builder does not
+    /// surface: a client certificate for mutual TLS (`use_rustls_tls()` +
+    /// [`Identity`](reqwest::Identity)), a custom root store, a proxy, a shared
+    /// connection pool, or a custom DNS resolver. In particular it is how you
+    /// pair this crate with an `acton-service` listener that verifies client
+    /// certificates — build a reqwest client carrying the client identity and
+    /// hand it in here.
+    ///
+    /// The [`bearer_token`](Self::bearer_token) and
+    /// [`default_header`](Self::default_header) values still apply: they are sent
+    /// per-request rather than baked into the client, so they work identically
+    /// whether or not a client is supplied. Only [`timeout`](Self::timeout) is
+    /// ignored with a supplied client — configure the timeout on the client you
+    /// pass in.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use acton_service_client::ServiceClient;
+    /// # fn make_tls_client() -> reqwest::Client { unimplemented!() }
+    /// # fn run() -> Result<(), acton_service_client::ClientError> {
+    /// let mtls: reqwest::Client = make_tls_client();
+    /// let client = ServiceClient::builder("https://api.example.com")
+    ///     .bearer_token("token")
+    ///     .with_http_client(mtls)
+    ///     .build()?;
+    /// # let _ = client;
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[must_use]
+    pub fn with_http_client(mut self, client: reqwest::Client) -> Self {
+        self.http_client = Some(client);
+        self
+    }
+
     /// Validate configuration and build the [`ServiceClient`].
     ///
     /// # Errors
     ///
     /// Returns [`ClientError::Config`] if the base URL is not a valid absolute
     /// `http`/`https` URL, or if the bearer token cannot be encoded as a header
-    /// value, or if the underlying HTTP client cannot be constructed.
+    /// value, or if the underlying HTTP client cannot be constructed. A client
+    /// supplied via [`with_http_client`](Self::with_http_client) is used as-is,
+    /// so the last case cannot arise on that path.
     pub fn build(mut self) -> Result<ServiceClient, ClientError> {
         let parsed = url::Url::parse(&self.base_url).map_err(|e| {
             ClientError::Config(format!("invalid base URL {:?}: {e}", self.base_url))
@@ -281,11 +329,13 @@ impl ServiceClientBuilder {
                 .insert(reqwest::header::AUTHORIZATION, value);
         }
 
-        let http = reqwest::Client::builder()
-            .timeout(self.timeout)
-            .default_headers(self.default_headers)
-            .build()
-            .map_err(|e| ClientError::Config(format!("failed to build HTTP client: {e}")))?;
+        let http = match self.http_client {
+            Some(client) => client,
+            None => reqwest::Client::builder()
+                .timeout(self.timeout)
+                .build()
+                .map_err(|e| ClientError::Config(format!("failed to build HTTP client: {e}")))?,
+        };
 
         Ok(ServiceClient {
             inner: Arc::new(Inner {
@@ -294,6 +344,7 @@ impl ServiceClientBuilder {
                 base_path: self.base_path,
                 version: self.version,
                 retry: self.retry,
+                default_headers: self.default_headers,
             }),
         })
     }
@@ -340,5 +391,38 @@ mod tests {
             .build()
             .unwrap_err();
         assert!(matches!(err, ClientError::Config(_)));
+    }
+
+    #[test]
+    fn bearer_token_is_stored_as_a_default_header() {
+        let client = ServiceClient::builder("https://api.example.com")
+            .bearer_token("secret")
+            .build()
+            .unwrap();
+        let auth = client
+            .inner
+            .default_headers
+            .get(reqwest::header::AUTHORIZATION)
+            .unwrap();
+        assert_eq!(auth, "Bearer secret");
+        assert!(auth.is_sensitive());
+    }
+
+    #[test]
+    fn with_http_client_builds_and_preserves_default_headers() {
+        let supplied = reqwest::Client::new();
+        let client = ServiceClient::builder("https://api.example.com")
+            .bearer_token("secret")
+            .with_http_client(supplied)
+            .build()
+            .unwrap();
+        // The bearer token is carried per-request, not baked into the supplied
+        // client, so it survives on the custom-client path.
+        assert!(
+            client
+                .inner
+                .default_headers
+                .contains_key(reqwest::header::AUTHORIZATION)
+        );
     }
 }
