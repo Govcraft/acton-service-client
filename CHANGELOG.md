@@ -25,11 +25,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `RequestBuilder::retry_on_status(StatusCode)`: extends the retriable
   statuses for one request, checked before `accept_status`. It takes effect
   only when retries apply (idempotent method or `.retriable(true)`).
+- `ServiceClientBuilder::attempt_timeout(Duration)`: a client-wide
+  per-attempt timeout that works for a built client and for one supplied via
+  `with_http_client`. Per-attempt precedence: the request's `.timeout()`, then
+  `attempt_timeout`, then the builder's `timeout` (built client only). Under a
+  deadline, whichever applies is clamped to the time remaining. With no
+  deadline and neither override, no per-request timeout is set, as in 0.1.
 - `RequestBuilder::timeout(Duration)`: a per-attempt timeout override.
 - `RequestBuilder::deadline_at(Instant)`: an absolute deadline, so several
   sends of one operation share one budget. A request whose deadline has
   already passed is not sent and fails with `ClientError::Config`.
 - `Jitter` is re-exported at the crate root.
+
+### Notes
+
+- Under a deadline, a client supplied via `with_http_client` has its own
+  timeout **replaced** on every attempt by the remaining budget. This crate
+  cannot read that timeout, and reqwest applies one timeout per request. Set
+  `attempt_timeout` (or a request `.timeout()`) to keep a tighter bound.
+- A server `Retry-After` is honoured as in 0.1: not capped by `max_delay` and,
+  without a deadline, not bounded at all. Set a deadline to bound it.
 
 ### Changed
 

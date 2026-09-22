@@ -166,6 +166,12 @@ let answer: Answer = client
   ceiling]`. The floor at `base_delay` is deliberate: unlike textbook full
   jitter, no pause is ever near zero, so an always-failing upstream is never
   hammered in a tight loop.
+- **Per-attempt timeout.** The request's `.timeout()` wins, then the client's
+  `ServiceClientBuilder::attempt_timeout`, then the builder's `timeout`. Under a
+  deadline, whichever applies is clamped to the time remaining. With a client
+  supplied via `with_http_client`, a deadline **replaces** that client's own
+  timeout with the remaining budget on every attempt. Set `attempt_timeout` to
+  keep a tighter bound.
 - **Extra statuses.** `RequestBuilder::retry_on_status` extends the retriable
   set per request. It is checked before `accept_status`, so an accepted status
   listed for retry is retried first and still returned raw once retries run

@@ -21,11 +21,14 @@ pub(crate) struct Inner {
     pub(crate) base_path: String,
     pub(crate) version: ApiVersion,
     pub(crate) retry: Option<RetryPolicy>,
-    /// The per-attempt timeout the builder baked into `http`, or `None` when
-    /// the client was supplied via [`ServiceClientBuilder::with_http_client`]
-    /// (whose own timeout cannot be observed). Consulted only when a deadline
-    /// is in effect, to take `min(timeout, remaining)`.
+    /// The timeout the builder baked into `http`, or `None` when the client
+    /// was supplied via [`ServiceClientBuilder::with_http_client`] (whose own
+    /// timeout cannot be observed). Consulted only under a deadline, as the
+    /// last fallback before `remaining`.
     pub(crate) timeout: Option<Duration>,
+    /// The client-wide per-attempt timeout
+    /// ([`ServiceClientBuilder::attempt_timeout`]), for any HTTP client.
+    pub(crate) attempt_timeout: Option<Duration>,
     /// Headers applied to every request (bearer token plus any
     /// [`ServiceClientBuilder::default_header`]). Held here rather than baked
     /// into the [`reqwest::Client`] so they apply equally to a client supplied
@@ -198,6 +201,7 @@ pub struct ServiceClientBuilder {
     version: ApiVersion,
     bearer_token: Option<String>,
     timeout: Duration,
+    attempt_timeout: Option<Duration>,
     retry: Option<RetryPolicy>,
     default_headers: HeaderMap,
     http_client: Option<reqwest::Client>,
@@ -211,6 +215,7 @@ impl ServiceClientBuilder {
             version: ApiVersion::V1,
             bearer_token: None,
             timeout: Duration::from_secs(30),
+            attempt_timeout: None,
             retry: None,
             default_headers: HeaderMap::new(),
             http_client: None,
@@ -239,14 +244,19 @@ impl ServiceClientBuilder {
         self
     }
 
-    /// Set the per-attempt timeout (default 30s).
+    /// Set the timeout of the HTTP client the builder constructs (default 30s).
     ///
     /// Each attempt, including each retry, gets this long. Under a deadline
     /// ([`RetryPolicy::deadline`] or
     /// [`RequestBuilder::deadline_at`](crate::RequestBuilder::deadline_at)) an
-    /// attempt gets the smaller of this and the time remaining. A single request
-    /// can override it with
-    /// [`RequestBuilder::timeout`](crate::RequestBuilder::timeout).
+    /// attempt gets the smaller of this and the time remaining.
+    /// [`attempt_timeout`](Self::attempt_timeout) and
+    /// [`RequestBuilder::timeout`](crate::RequestBuilder::timeout) take
+    /// precedence over it.
+    ///
+    /// Ignored with a client supplied via
+    /// [`with_http_client`](Self::with_http_client); use
+    /// [`attempt_timeout`](Self::attempt_timeout) there.
     ///
     /// # Examples
     ///
@@ -263,6 +273,50 @@ impl ServiceClientBuilder {
     #[must_use]
     pub fn timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
+        self
+    }
+
+    /// Set a client-wide per-attempt timeout, for a built **or supplied** HTTP
+    /// client.
+    ///
+    /// Each attempt, including each retry, is sent with this as its reqwest
+    /// per-request timeout, clamped to the time remaining under a deadline.
+    /// This is the way to bound attempts on a client supplied via
+    /// [`with_http_client`](Self::with_http_client), whose own timeout is
+    /// otherwise replaced by the remaining budget under a deadline.
+    ///
+    /// The timeout for one attempt is chosen in this order, and in every case
+    /// clamped to the time remaining before the deadline, if there is one:
+    ///
+    /// 1. the request's [`RequestBuilder::timeout`](crate::RequestBuilder::timeout);
+    /// 2. this client-wide `attempt_timeout`;
+    /// 3. the builder's [`timeout`](Self::timeout), for a client the builder
+    ///    constructs (under a deadline only; otherwise it is already the
+    ///    client's own timeout);
+    /// 4. with none of these, the remaining budget itself.
+    ///
+    /// Without a deadline and without either of the first two, no per-request
+    /// timeout is set at all, exactly as in 0.1.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use acton_service_client::{RetryPolicy, ServiceClient};
+    /// use std::time::Duration;
+    /// # fn make_tls_client() -> acton_service_client::reqwest::Client { acton_service_client::reqwest::Client::new() }
+    ///
+    /// // A supplied mTLS client: 5s per attempt, 15s for the whole call.
+    /// let client = ServiceClient::builder("https://api.example.com")
+    ///     .with_http_client(make_tls_client())
+    ///     .attempt_timeout(Duration::from_secs(5))
+    ///     .retry(RetryPolicy::default().deadline(Duration::from_secs(15)))
+    ///     .build()
+    ///     .expect("valid base url");
+    /// # let _ = client;
+    /// ```
+    #[must_use]
+    pub fn attempt_timeout(mut self, timeout: Duration) -> Self {
+        self.attempt_timeout = Some(timeout);
         self
     }
 
@@ -296,17 +350,19 @@ impl ServiceClientBuilder {
     /// per-request rather than baked into the client, so they work identically
     /// whether or not a client is supplied. Only [`timeout`](Self::timeout) is
     /// ignored with a supplied client — configure the timeout on the client you
-    /// pass in.
+    /// pass in, or use [`attempt_timeout`](Self::attempt_timeout).
     ///
-    /// A deadline ([`RetryPolicy::deadline`] or
-    /// [`RequestBuilder::deadline_at`](crate::RequestBuilder::deadline_at))
-    /// still works with a supplied client, with one difference: the supplied
-    /// client's own timeout cannot be observed, so under a deadline each attempt
-    /// is bounded by the time remaining rather than by `min(timeout,
-    /// remaining)`. reqwest applies one timeout per request, so this replaces
-    /// the supplied client's timeout for that attempt. To keep a per-attempt cap
-    /// shorter than the deadline, set
-    /// [`RequestBuilder::timeout`](crate::RequestBuilder::timeout) on the request.
+    /// # Deadlines replace the supplied client's timeout
+    ///
+    /// Under a deadline ([`RetryPolicy::deadline`] or
+    /// [`RequestBuilder::deadline_at`](crate::RequestBuilder::deadline_at)), the
+    /// supplied client's own timeout is **replaced** on every attempt by the
+    /// remaining budget. This crate cannot read that timeout, and reqwest
+    /// applies one timeout per request, so a 5s client timeout under a 60s
+    /// deadline lets a single attempt run for up to 60s. To keep a tighter
+    /// per-attempt bound, set [`attempt_timeout`](Self::attempt_timeout) here
+    /// (or [`RequestBuilder::timeout`](crate::RequestBuilder::timeout) on one
+    /// request).
     ///
     /// # Examples
     ///
@@ -385,6 +441,7 @@ impl ServiceClientBuilder {
                 version: self.version,
                 retry: self.retry,
                 timeout,
+                attempt_timeout: self.attempt_timeout,
                 default_headers: self.default_headers,
             }),
         })
@@ -424,6 +481,7 @@ mod tests {
         assert_eq!(client.inner.base_path, "/api");
         assert!(client.inner.retry.is_none());
         assert_eq!(client.inner.timeout, Some(Duration::from_secs(30)));
+        assert_eq!(client.inner.attempt_timeout, None);
     }
 
     #[test]
@@ -451,6 +509,22 @@ mod tests {
     }
 
     #[test]
+    fn attempt_timeout_is_kept_for_built_and_supplied_clients() {
+        let built = ServiceClient::builder("https://api.example.com")
+            .attempt_timeout(Duration::from_secs(2))
+            .build()
+            .unwrap();
+        assert_eq!(built.inner.attempt_timeout, Some(Duration::from_secs(2)));
+        let supplied = ServiceClient::builder("https://api.example.com")
+            .with_http_client(reqwest::Client::new())
+            .attempt_timeout(Duration::from_secs(2))
+            .build()
+            .unwrap();
+        assert_eq!(supplied.inner.attempt_timeout, Some(Duration::from_secs(2)));
+        assert_eq!(supplied.inner.timeout, None);
+    }
+
+    #[test]
     fn with_http_client_builds_and_preserves_default_headers() {
         let supplied = reqwest::Client::new();
         let client = ServiceClient::builder("https://api.example.com")
@@ -460,6 +534,7 @@ mod tests {
             .unwrap();
         // A supplied client's timeout cannot be observed.
         assert_eq!(client.inner.timeout, None);
+        assert_eq!(client.inner.attempt_timeout, None);
         // The bearer token is carried per-request, not baked into the supplied
         // client, so it survives on the custom-client path.
         assert!(

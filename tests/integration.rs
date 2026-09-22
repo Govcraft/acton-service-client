@@ -986,3 +986,156 @@ async fn default_policy_retries_connect_failures_on_the_0_1_2_schedule() {
     assert!(elapsed >= Duration::from_millis(300), "{elapsed:?}");
     assert!(elapsed < Duration::from_millis(600), "{elapsed:?}");
 }
+
+// ---------------------------------------------------------------------------
+// Per-attempt timeout precedence: request > attempt_timeout > builder timeout
+// (built client only) > remaining, always clamped to the deadline.
+// ---------------------------------------------------------------------------
+
+/// A server that holds every request for far longer than any test waits.
+async fn spawn_stalled() -> (String, Hits) {
+    spawn_scripted(Script {
+        status: AxumStatus::OK,
+        retry_after: None,
+        delay: Duration::from_secs(60),
+    })
+    .await
+}
+
+/// One attempt only, so the elapsed time is the first attempt's timeout.
+fn single_attempt(deadline: Duration) -> RetryPolicy {
+    RetryPolicy::default().max_attempts(1).deadline(deadline)
+}
+
+/// Send a GET to `scripted`, expect a timeout, and return how long it took.
+async fn time_to_timeout(request: acton_service_client::RequestBuilder) -> Duration {
+    let started = std::time::Instant::now();
+    let err = request.send().await.unwrap_err();
+    let elapsed = started.elapsed();
+    assert_timeout(&err);
+    elapsed
+}
+
+fn assert_near(elapsed: Duration, expected: Duration) {
+    let slack = Duration::from_millis(150);
+    assert!(
+        elapsed + Duration::from_millis(10) >= expected && elapsed < expected + slack,
+        "expected ~{expected:?}, took {elapsed:?}"
+    );
+}
+
+/// The trap, pinned: under a deadline, a supplied client's own timeout is
+/// REPLACED by the remaining budget. Its 100ms timeout does not fire; the
+/// 400ms deadline does. A request `.timeout()` restores a tighter bound.
+#[tokio::test]
+async fn supplied_client_timeout_is_replaced_by_the_remaining_budget() {
+    let (base, _hits) = spawn_stalled().await;
+    let supplied = acton_service_client::reqwest::Client::builder()
+        .timeout(Duration::from_millis(100))
+        .build()
+        .unwrap();
+    let client = ServiceClient::builder(&base)
+        .with_http_client(supplied)
+        .retry(single_attempt(Duration::from_millis(400)))
+        .build()
+        .unwrap();
+
+    let elapsed =
+        time_to_timeout(client.request(acton_service_client::Method::GET, "scripted")).await;
+    assert_near(elapsed, Duration::from_millis(400));
+
+    let elapsed = time_to_timeout(
+        client
+            .request(acton_service_client::Method::GET, "scripted")
+            .timeout(Duration::from_millis(150)),
+    )
+    .await;
+    assert_near(elapsed, Duration::from_millis(150));
+}
+
+/// Without a deadline the supplied client's own timeout is left alone.
+#[tokio::test]
+async fn supplied_client_keeps_its_own_timeout_without_a_deadline() {
+    let (base, _hits) = spawn_stalled().await;
+    let supplied = acton_service_client::reqwest::Client::builder()
+        .timeout(Duration::from_millis(150))
+        .build()
+        .unwrap();
+    let client = ServiceClient::builder(&base)
+        .with_http_client(supplied)
+        .build()
+        .unwrap();
+    let elapsed =
+        time_to_timeout(client.request(acton_service_client::Method::GET, "scripted")).await;
+    assert_near(elapsed, Duration::from_millis(150));
+}
+
+/// The reviewer's case: a supplied client with a 5s `attempt_timeout` under a
+/// 15s deadline against a stalled server times out at ~5s, not 15s.
+#[tokio::test]
+async fn supplied_client_attempt_timeout_bounds_each_attempt_under_a_long_deadline() {
+    let (base, hits) = spawn_stalled().await;
+    let client = ServiceClient::builder(&base)
+        .with_http_client(acton_service_client::reqwest::Client::new())
+        .attempt_timeout(Duration::from_secs(5))
+        .retry(single_attempt(Duration::from_secs(15)))
+        .build()
+        .unwrap();
+    let elapsed =
+        time_to_timeout(client.request(acton_service_client::Method::GET, "scripted")).await;
+    assert!(
+        elapsed >= Duration::from_millis(4990) && elapsed < Duration::from_millis(5500),
+        "expected ~5s, took {elapsed:?}"
+    );
+    assert_eq!(hit_count(&hits), 1);
+}
+
+/// Each precedence level winning in turn, and the deadline clamping them all.
+#[tokio::test]
+async fn attempt_timeout_precedence_each_level_wins_and_the_deadline_clamps() {
+    let (base, _hits) = spawn_stalled().await;
+    let ms = Duration::from_millis;
+    let get = |c: &ServiceClient| c.request(acton_service_client::Method::GET, "scripted");
+
+    // 1. The request override beats attempt_timeout and the builder timeout.
+    let c = ServiceClient::builder(&base)
+        .timeout(ms(900))
+        .attempt_timeout(ms(600))
+        .retry(single_attempt(Duration::from_secs(5)))
+        .build()
+        .unwrap();
+    assert_near(time_to_timeout(get(&c).timeout(ms(150))).await, ms(150));
+
+    // 2. attempt_timeout beats the builder timeout (under a deadline)...
+    assert_near(time_to_timeout(get(&c)).await, ms(600));
+
+    // ...and applies without a deadline too (opt-in per-request timeout).
+    let c = ServiceClient::builder(&base)
+        .timeout(Duration::from_secs(5))
+        .attempt_timeout(ms(200))
+        .build()
+        .unwrap();
+    assert_near(time_to_timeout(get(&c)).await, ms(200));
+
+    // 3. The builder timeout, for a built client under a deadline.
+    let c = ServiceClient::builder(&base)
+        .timeout(ms(250))
+        .retry(single_attempt(Duration::from_secs(5)))
+        .build()
+        .unwrap();
+    assert_near(time_to_timeout(get(&c)).await, ms(250));
+
+    // 4. The deadline clamps every level: 300ms remaining beats a 2s
+    //    override, a 3s attempt_timeout, and a 5s builder timeout.
+    let c = ServiceClient::builder(&base)
+        .timeout(Duration::from_secs(5))
+        .attempt_timeout(Duration::from_secs(3))
+        .retry(single_attempt(ms(300)))
+        .build()
+        .unwrap();
+    assert_near(
+        time_to_timeout(get(&c).timeout(Duration::from_secs(2))).await,
+        ms(300),
+    );
+    assert_near(time_to_timeout(get(&c)).await, ms(300));
+}

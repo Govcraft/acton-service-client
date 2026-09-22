@@ -187,9 +187,21 @@ impl RequestBuilder {
 
     /// Override the per-attempt timeout for this request.
     ///
-    /// Replaces the client's [`timeout`](crate::ServiceClientBuilder::timeout)
-    /// for every attempt of this request. Under a deadline an attempt gets the
-    /// smaller of this and the time remaining.
+    /// Takes precedence over the client's
+    /// [`attempt_timeout`](crate::ServiceClientBuilder::attempt_timeout) and
+    /// [`timeout`](crate::ServiceClientBuilder::timeout) for every attempt of
+    /// this request, including with a client supplied via
+    /// [`with_http_client`](crate::ServiceClientBuilder::with_http_client).
+    /// Under a deadline an attempt gets the smaller of this and the time
+    /// remaining.
+    ///
+    /// **Supplied client under a deadline:** a client passed to
+    /// [`with_http_client`](crate::ServiceClientBuilder::with_http_client) does
+    /// not expose its own timeout, and reqwest applies one timeout per request.
+    /// So under a deadline, that client's own timeout is **replaced** on every
+    /// attempt by the remaining budget. To keep a tighter per-attempt bound,
+    /// set [`ServiceClientBuilder::attempt_timeout`](crate::ServiceClientBuilder::attempt_timeout)
+    /// (client-wide) or this method (one request).
     ///
     /// # Examples
     ///
@@ -418,9 +430,12 @@ impl RequestBuilder {
             if let Some(body) = &self.body {
                 rb = rb.body(body.clone());
             }
-            if let Some(timeout) =
-                attempt_timeout(self.timeout, self.client.inner.timeout, remaining)
-            {
+            if let Some(timeout) = attempt_timeout(
+                self.timeout,
+                self.client.inner.attempt_timeout,
+                self.client.inner.timeout,
+                remaining,
+            ) {
                 rb = rb.timeout(timeout);
             }
 

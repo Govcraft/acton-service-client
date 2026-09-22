@@ -189,9 +189,10 @@ impl RetryPolicy {
     /// Bound the whole call, first send to last response, by `deadline`.
     ///
     /// - Each attempt's timeout becomes the smaller of the configured timeout
-    ///   (the client's [`timeout`](crate::ServiceClientBuilder::timeout) or the
-    ///   request's [`timeout`](crate::RequestBuilder::timeout)) and the time
-    ///   remaining.
+    ///   (the request's [`timeout`](crate::RequestBuilder::timeout), else the
+    ///   client's [`attempt_timeout`](crate::ServiceClientBuilder::attempt_timeout),
+    ///   else the builder's [`timeout`](crate::ServiceClientBuilder::timeout))
+    ///   and the time remaining.
     /// - A pause, from backoff or from a server `Retry-After`, that would end
     ///   at or after the deadline is not taken: the loop stops and returns the
     ///   last error or response.
@@ -201,6 +202,15 @@ impl RetryPolicy {
     /// [`retriable`](crate::RequestBuilder::retriable)), whose single attempt
     /// is then bounded by it. To share one budget across several calls, use
     /// [`RequestBuilder::deadline_at`](crate::RequestBuilder::deadline_at).
+    ///
+    /// **Supplied client under a deadline:** a client passed to
+    /// [`with_http_client`](crate::ServiceClientBuilder::with_http_client) does
+    /// not expose its own timeout, and reqwest applies one timeout per request.
+    /// So under a deadline, that client's own timeout is **replaced** on every
+    /// attempt by the remaining budget. To keep a tighter per-attempt bound,
+    /// set [`ServiceClientBuilder::attempt_timeout`](crate::ServiceClientBuilder::attempt_timeout)
+    /// (client-wide) or [`RequestBuilder::timeout`](crate::RequestBuilder::timeout)
+    /// (one request).
     ///
     /// # Examples
     ///
@@ -468,22 +478,28 @@ pub(crate) fn remaining_until(deadline: Option<Instant>, now: Instant) -> Option
 
 /// The timeout for one attempt, or `None` to leave the HTTP client's own.
 ///
-/// - `request` is the per-request override ([`RequestBuilder::timeout`](crate::RequestBuilder::timeout)).
-/// - `client` is the builder-configured client timeout, or `None` for a
-///   client supplied via `with_http_client`, whose timeout cannot be observed.
-/// - `remaining` is the time left before the deadline, if there is one.
+/// Precedence, and in every case clamped to `remaining` when there is a
+/// deadline:
 ///
-/// With neither an override nor a deadline, the request carries no timeout of
-/// its own, exactly as in 0.1.
+/// 1. `request`: the per-request override ([`RequestBuilder::timeout`](crate::RequestBuilder::timeout));
+/// 2. `client_attempt`: the client-wide [`ServiceClientBuilder::attempt_timeout`](crate::ServiceClientBuilder::attempt_timeout);
+/// 3. `builder`: the builder's `timeout`, `None` for a supplied client whose
+///    own timeout cannot be observed; consulted only under a deadline, since
+///    without one it is already the HTTP client's own timeout;
+/// 4. `remaining` itself.
+///
+/// With no deadline and neither of the first two, the request carries no
+/// timeout of its own, exactly as in 0.1.
 pub(crate) fn attempt_timeout(
     request: Option<Duration>,
-    client: Option<Duration>,
+    client_attempt: Option<Duration>,
+    builder: Option<Duration>,
     remaining: Option<Duration>,
 ) -> Option<Duration> {
-    match (request, remaining) {
-        (None, None) => None,
-        (Some(own), None) => Some(own),
-        (request, Some(left)) => Some(request.or(client).map_or(left, |own| own.min(left))),
+    let configured = request.or(client_attempt);
+    match remaining {
+        None => configured,
+        Some(left) => Some(configured.or(builder).map_or(left, |own| own.min(left))),
     }
 }
 
@@ -726,30 +742,55 @@ mod tests {
         );
     }
 
+    /// The full precedence table: request > client attempt > builder >
+    /// remaining, every level clamped to the remaining budget.
     #[test]
-    fn attempt_timeout_is_the_min_of_timeout_and_remaining() {
+    fn attempt_timeout_precedence_table() {
         let s = Duration::from_secs;
-        // No override, no deadline: leave the HTTP client's own timeout alone.
-        assert_eq!(attempt_timeout(None, Some(s(30)), None), None);
-        assert_eq!(attempt_timeout(None, None, None), None);
-        // An override without a deadline is used as-is.
-        assert_eq!(attempt_timeout(Some(s(2)), Some(s(30)), None), Some(s(2)));
-        // Under a deadline: min(override or client timeout, remaining).
-        assert_eq!(attempt_timeout(None, Some(s(30)), Some(s(4))), Some(s(4)));
-        assert_eq!(attempt_timeout(None, Some(s(3)), Some(s(4))), Some(s(3)));
+        let (req, att, bld) = (Some(s(1)), Some(s(2)), Some(s(3)));
+        let (tight, mid) = (Some(ms(500)), Some(ms(2500)));
+        type Row = (Opt, Opt, Opt, Opt, Opt);
+        type Opt = Option<Duration>;
+        let table: [Row; 20] = [
+            // request, client attempt, builder, remaining => expected
+            // No deadline: only the opt-in levels set a per-request timeout.
+            (None, None, None, None, None),
+            (None, None, bld, None, None), // 0.1: client keeps its own
+            (None, att, None, None, att),  // supplied client, opted in
+            (None, att, bld, None, att),
+            (req, None, None, None, req),
+            (req, att, bld, None, req), // request wins
+            // Generous deadline (10s): the highest level present wins.
+            (req, att, bld, Some(s(10)), req),
+            (None, att, bld, Some(s(10)), att),
+            (None, None, bld, Some(s(10)), bld),
+            (None, None, None, Some(s(10)), Some(s(10))), // supplied, no cap: remaining
+            (req, None, bld, Some(s(10)), req),
+            (None, att, None, Some(s(10)), att),
+            // Tight deadline (500ms): every level is clamped to remaining.
+            (req, att, bld, tight, tight),
+            (None, att, bld, tight, tight),
+            (None, None, bld, tight, tight),
+            (None, None, None, tight, tight),
+            // Between levels (2.5s): request and attempt fit, builder is clamped.
+            (req, att, bld, mid, req),
+            (None, att, bld, mid, att),
+            (None, None, bld, mid, mid),
+            // Expired budget.
+            (req, att, bld, Some(Duration::ZERO), Some(Duration::ZERO)),
+        ];
+        for (request, client_attempt, builder, remaining, expected) in table {
+            assert_eq!(
+                attempt_timeout(request, client_attempt, builder, remaining),
+                expected,
+                "request={request:?} attempt={client_attempt:?} builder={builder:?} remaining={remaining:?}"
+            );
+        }
+        // The reviewer's case: a supplied client (no builder timeout) with a
+        // 5s attempt_timeout under a 15s deadline gets 5s per attempt.
         assert_eq!(
-            attempt_timeout(Some(s(1)), Some(s(30)), Some(s(4))),
-            Some(s(1))
-        );
-        assert_eq!(
-            attempt_timeout(Some(s(9)), Some(s(3)), Some(s(4))),
-            Some(s(4))
-        );
-        // A supplied client's timeout is unknown: the deadline governs.
-        assert_eq!(attempt_timeout(None, None, Some(s(4))), Some(s(4)));
-        assert_eq!(
-            attempt_timeout(None, None, Some(Duration::ZERO)),
-            Some(Duration::ZERO)
+            attempt_timeout(None, Some(s(5)), None, Some(s(15))),
+            Some(s(5))
         );
     }
 
@@ -769,8 +810,22 @@ mod tests {
         assert!(!wants_retry(s421, None, false, &[s503]));
     }
 
+    /// The 0.1.2 retriable-status rule, copied verbatim from its
+    /// `ApiError::is_retriable`, as an independent oracle: the refactored
+    /// rule is checked against this, not against itself.
+    fn retriable_in_0_1_2(status: StatusCode, has_retry_after: bool) -> bool {
+        match status {
+            StatusCode::TOO_MANY_REQUESTS
+            | StatusCode::BAD_GATEWAY
+            | StatusCode::SERVICE_UNAVAILABLE
+            | StatusCode::GATEWAY_TIMEOUT => true,
+            StatusCode::LOCKED => has_retry_after,
+            _ => false,
+        }
+    }
+
     /// Defaults must reproduce 0.1.2 exactly: same retriable statuses, same
-    /// pauses, same attempt count, no per-request timeout.
+    /// pauses (Retry-After included), same attempt count, no per-request timeout.
     #[test]
     fn defaults_reproduce_the_0_1_2_schedule() {
         let p = RetryPolicy::default();
@@ -784,6 +839,15 @@ mod tests {
             assert_eq!(p.next_pause(1, draw, server, None), server);
             assert_eq!(p.next_pause(3, draw, server, None), None);
         }
+        // 0.1.2 honoured Retry-After verbatim: not capped by max_delay, not
+        // bounded at all. With no deadline an absurd value is still honoured
+        // as-is; bound it by setting a deadline.
+        for absurd in [
+            Duration::from_secs(3600),
+            Duration::from_secs(u64::from(u32::MAX)),
+        ] {
+            assert_eq!(p.next_pause(1, 0.5, Some(absurd), None), Some(absurd));
+        }
         let big = RetryPolicy::with_max_attempts(40);
         for attempt in 1..40 {
             assert_eq!(
@@ -791,25 +855,29 @@ mod tests {
                 Some(big.backoff_delay(attempt))
             );
         }
-        // Retriable statuses are exactly ApiError::is_retriable's, and an
-        // accepted status is never retried.
-        let mut locked = HeaderMap::new();
-        locked.insert("retry-after", "30".parse().unwrap());
+        // Both directions over 100..600: every status 0.1.2 retried is
+        // retried, and every status it did not retry is not. An accepted
+        // status is never retried (0.1.2 returned it before looking).
+        let mut with_retry_after = HeaderMap::new();
+        with_retry_after.insert("retry-after", "30".parse().unwrap());
+        let mut retried = 0;
         for code in 100..600u16 {
             let status = StatusCode::from_u16(code).unwrap();
-            for headers in [HeaderMap::new(), locked.clone()] {
+            for headers in [HeaderMap::new(), with_retry_after.clone()] {
                 let api = build_api_error(status, &headers, "");
-                assert_eq!(
-                    wants_retry(status, api.retry_after, false, &[]),
-                    api.is_retriable(),
-                    "{status}"
-                );
-                assert!(!wants_retry(status, api.retry_after, true, &[]));
+                let then = retriable_in_0_1_2(status, headers.contains_key("retry-after"));
+                let now = wants_retry(status, api.retry_after, false, &[]);
+                assert_eq!(now, then, "{status} retry-after={:?}", api.retry_after);
+                assert_eq!(api.is_retriable(), then, "{status}");
+                assert!(!wants_retry(status, api.retry_after, true, &[]), "{status}");
+                retried += usize::from(now);
             }
         }
-        // No override, no deadline: no per-request timeout is set.
+        // 429/502/503/504 with and without Retry-After, 423 only with it.
+        assert_eq!(retried, 4 * 2 + 1);
+        // No override, no attempt_timeout, no deadline: no per-request timeout.
         assert_eq!(
-            attempt_timeout(None, Some(Duration::from_secs(30)), None),
+            attempt_timeout(None, None, Some(Duration::from_secs(30)), None),
             None
         );
     }
