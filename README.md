@@ -119,6 +119,10 @@ Every fallible call returns `ClientError`:
 - **`Decode { status, snippet, source }`** — a success body that failed to
   deserialize; keeps a truncated snippet for diagnostics.
 - **`Config(String)`** — builder-time validation (e.g. bad base URL).
+- **`DeadlineExceeded { attempts, elapsed }`** — the call's deadline passed
+  before anything was sent. Not retriable.
+
+`ClientError` is `#[non_exhaustive]`: match it with a wildcard arm.
 
 `ApiError::is_retriable()` is true for `429`, `502`, `503`, `504`, and for `423`
 only when a `Retry-After` was supplied.
@@ -162,6 +166,10 @@ let answer: Answer = client
   backoff or `Retry-After`) that would reach the deadline is not taken: the last
   error or response is returned. `RequestBuilder::deadline_at(Instant)` sets an
   absolute deadline instead, so several sends of one operation share one budget.
+  If the budget is already spent before anything is sent, the call fails with
+  `ClientError::DeadlineExceeded` and the server never sees it. Without a
+  deadline, `Retry-After` is honoured uncapped, as in 0.1: set a deadline to
+  bound it.
 - **Jitter.** `Jitter::Full` draws each pause uniformly from `[base_delay,
   ceiling]`. The floor at `base_delay` is deliberate: unlike textbook full
   jitter, no pause is ever near zero, so an always-failing upstream is never

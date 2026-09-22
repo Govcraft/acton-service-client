@@ -777,8 +777,8 @@ async fn deadline_at_is_shared_across_sends() {
     assert!(total < Duration::from_millis(650), "{total:?}");
 }
 
-/// A request whose deadline has already passed is not sent at all, and the
-/// error says what to do about it.
+/// A request whose deadline has already passed is not sent at all: it fails
+/// with `DeadlineExceeded { attempts: 0, .. }`, and the server sees nothing.
 #[tokio::test]
 async fn expired_deadline_fails_without_sending() {
     let (base, hits) = spawn_scripted(Script::status(AxumStatus::OK)).await;
@@ -791,13 +791,31 @@ async fn expired_deadline_fails_without_sending() {
         .await
         .unwrap_err();
     match &err {
-        ClientError::Config(message) => {
-            assert!(message.contains("deadline"), "{message}");
-            assert!(message.contains("not sent"), "{message}");
+        ClientError::DeadlineExceeded { attempts, elapsed } => {
+            assert_eq!(*attempts, 0, "nothing was sent");
+            assert!(*elapsed < Duration::from_millis(50), "{elapsed:?}");
         }
-        other => panic!("expected a config error, got {other:?}"),
+        other => panic!("expected DeadlineExceeded, got {other:?}"),
     }
     assert!(!err.is_retriable());
+    assert!(err.to_string().contains("widen the deadline"));
+    assert_eq!(hit_count(&hits), 0, "the server never saw the request");
+}
+
+/// A zero policy deadline spends the budget before the first send: nothing
+/// goes out, whatever the method.
+#[tokio::test]
+async fn zero_policy_deadline_sends_nothing() {
+    let (base, hits) = spawn_scripted(Script::status(AxumStatus::OK)).await;
+    let client = retrying_client(&base, quick_policy().deadline(Duration::ZERO));
+    let err = client
+        .post::<_, serde_json::Value>("scripted", &json!({}))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, ClientError::DeadlineExceeded { attempts: 0, .. }),
+        "{err:?}"
+    );
     assert_eq!(hit_count(&hits), 0);
 }
 

@@ -33,8 +33,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   deadline and neither override, no per-request timeout is set, as in 0.1.
 - `RequestBuilder::timeout(Duration)`: a per-attempt timeout override.
 - `RequestBuilder::deadline_at(Instant)`: an absolute deadline, so several
-  sends of one operation share one budget. A request whose deadline has
-  already passed is not sent and fails with `ClientError::Config`.
+  sends of one operation share one budget.
+- `ClientError::DeadlineExceeded { attempts, elapsed }`: returned only when a
+  call's deadline has passed before anything was sent (for example, an
+  already-elapsed `deadline_at`), so the server never saw it. It is not
+  retriable, and its message says to widen the deadline or re-drive the
+  operation with the same idempotency identity. Once an attempt has gone out,
+  running out of budget returns that attempt's own outcome instead.
 - `Jitter` is re-exported at the crate root.
 
 ### Notes
@@ -44,13 +49,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   cannot read that timeout, and reqwest applies one timeout per request. Set
   `attempt_timeout` (or a request `.timeout()`) to keep a tighter bound.
 - A server `Retry-After` is honoured as in 0.1: not capped by `max_delay` and,
-  without a deadline, not bounded at all. Set a deadline to bound it.
+  without a deadline, not bounded at all: set a deadline to bound it.
 
 ### Changed
 
 - **Breaking:** `RetryPolicy` is now `#[non_exhaustive]` and has two new
   fields (`deadline`, `jitter`). Callers outside the crate can no longer build
   it with a struct literal.
+- **Breaking:** `ClientError` is now `#[non_exhaustive]` and has a new variant,
+  `DeadlineExceeded`.
 
 ### Migration
 
@@ -71,7 +78,14 @@ let policy = RetryPolicy::default()
     .max_delay(Duration::from_secs(1));
 ```
 
-Reading the fields (`policy.max_attempts`, ...) is unchanged. With the defaults
+Reading the fields (`policy.max_attempts`, ...) is unchanged.
+
+`ClientError` is now `#[non_exhaustive]`, so an exhaustive `match` on it needs
+a wildcard arm (`_ => ...`). Handle `ClientError::DeadlineExceeded` explicitly
+if you set a deadline.
+
+Without a deadline, a server `Retry-After` is still honoured uncapped, as in
+0.1.2: set a deadline to bound it. With the defaults
 (no deadline, `Jitter::None`, no extra statuses, no per-request overrides),
 retry attempts and delays are identical to 0.1.2.
 

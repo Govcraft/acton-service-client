@@ -68,6 +68,11 @@ pub enum Jitter {
 /// whole call, first send to last response, alongside `max_attempts`; whichever
 /// is reached first ends the loop, and the last error or response is returned.
 ///
+/// A server `Retry-After` replaces the computed pause (unjittered, and not
+/// capped by `max_delay`). With no deadline it is honoured **uncapped**, as in
+/// 0.1.2, so a `Retry-After: 3600` means an hour's sleep: set a deadline to
+/// bound it.
+///
 /// The struct is `#[non_exhaustive]`: build it from [`RetryPolicy::default`] or
 /// [`RetryPolicy::with_max_attempts`] and the builder methods, one per field.
 ///
@@ -195,7 +200,10 @@ impl RetryPolicy {
     ///   and the time remaining.
     /// - A pause, from backoff or from a server `Retry-After`, that would end
     ///   at or after the deadline is not taken: the loop stops and returns the
-    ///   last error or response.
+    ///   last error or response. Without a deadline, `Retry-After` is honoured
+    ///   uncapped, as in 0.1.2: set a deadline to bound it.
+    /// - If the deadline has passed before anything is sent, the call fails
+    ///   with [`ClientError::DeadlineExceeded`](crate::ClientError::DeadlineExceeded).
     ///
     /// The deadline applies to every call through the client, including one
     /// that is never retried (a `POST` without

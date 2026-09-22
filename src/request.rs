@@ -13,17 +13,6 @@ use crate::error::{ClientError, build_api_error, parse_retry_after, snippet};
 use crate::retry::{attempt_timeout, is_idempotent, remaining_until, wants_retry};
 use crate::url::{build_url, join_segments};
 
-/// The error for a request whose deadline passed before its first attempt,
-/// saying by how much and what to do about it.
-fn deadline_passed(deadline: Option<Instant>, started: Instant) -> ClientError {
-    let overdue = deadline.map_or(Duration::ZERO, |at| started.saturating_duration_since(at));
-    ClientError::Config(format!(
-        "request deadline had already passed {overdue:?} before the first attempt, so the \
-         request was not sent; pass a later `deadline_at`, or start the operation's budget \
-         earlier so each send gets time"
-    ))
-}
-
 /// A fluent builder for a single request.
 ///
 /// Obtained from [`ServiceClient::request`](crate::ServiceClient::request) or
@@ -233,7 +222,7 @@ impl RequestBuilder {
     /// pass it to each, and each request gets only what the earlier ones left.
     ///
     /// A request whose deadline has already passed is not sent: it fails at
-    /// once with a non-retriable [`ClientError::Config`] saying so. Once a
+    /// once with a non-retriable [`ClientError::DeadlineExceeded`]. Once a
     /// request has been sent, running out of budget returns the last attempt's
     /// error or response instead (an attempt cut short by the deadline is a
     /// [`ClientError::Transport`] timeout).
@@ -393,7 +382,7 @@ impl RequestBuilder {
     /// failures. An attempt cut short by the deadline is a
     /// [`ClientError::Transport`] timeout. A request whose deadline passed
     /// before its first attempt is not sent and fails with
-    /// [`ClientError::Config`].
+    /// [`ClientError::DeadlineExceeded`].
     pub async fn send(self) -> Result<reqwest::Response, ClientError> {
         self.execute(fastrand::f64).await
     }
@@ -416,7 +405,14 @@ impl RequestBuilder {
         loop {
             let remaining = remaining_until(deadline, Instant::now());
             if remaining == Some(Duration::ZERO) {
-                return last.unwrap_or_else(|| Err(deadline_passed(deadline, started)));
+                // Nothing sent yet (no `last`): the budget was spent before
+                // the first attempt.
+                return last.unwrap_or_else(|| {
+                    Err(ClientError::DeadlineExceeded {
+                        attempts: attempt - 1,
+                        elapsed: started.elapsed(),
+                    })
+                });
             }
             let mut rb = self
                 .client
