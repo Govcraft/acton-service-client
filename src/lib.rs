@@ -61,8 +61,29 @@
 //! Retries are off unless a [`RetryPolicy`] is configured, and then apply only
 //! to idempotent methods (`GET`/`HEAD`/`DELETE`/`PUT`) plus requests explicitly
 //! marked with [`RequestBuilder::retriable`]. A server `Retry-After` is honored
-//! when present; otherwise the delay is computed by
-//! [`RetryPolicy::backoff_delay`].
+//! when present; otherwise the pause is computed by [`RetryPolicy::pause`]: the
+//! [`RetryPolicy::backoff_delay`] ceiling, spread by [`Jitter`] when enabled.
+//!
+//! A [`RetryPolicy::deadline`] bounds a whole call, and
+//! [`RequestBuilder::deadline_at`] lets several calls share one absolute budget.
+//! [`RequestBuilder::retry_on_status`] and [`RequestBuilder::timeout`] adjust
+//! the retriable statuses and the per-attempt timeout for one request.
+//!
+//! ```
+//! use acton_service_client::{Jitter, RetryPolicy, ServiceClient};
+//! use std::time::Duration;
+//!
+//! let client = ServiceClient::builder("https://api.example.com")
+//!     .retry(
+//!         RetryPolicy::default()
+//!             .max_attempts(10)
+//!             .jitter(Jitter::Full)
+//!             .deadline(Duration::from_secs(3)),
+//!     )
+//!     .build()
+//!     .expect("valid base url");
+//! # let _ = client;
+//! ```
 //!
 //! # Custom HTTP client (mutual TLS, proxies, pools)
 //!
@@ -97,7 +118,7 @@ pub use context::{
 pub use error::{ApiError, ClientError, ErrorResponse, RateLimitInfo};
 pub use health::{DependencyStatus, HealthResponse, ReadinessResponse};
 pub use request::RequestBuilder;
-pub use retry::RetryPolicy;
+pub use retry::{Jitter, RetryPolicy};
 pub use versioning::ApiVersion;
 
 /// Re-export of `reqwest`'s `Method` for convenience.

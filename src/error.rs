@@ -146,14 +146,21 @@ impl ApiError {
     /// ```
     #[must_use]
     pub fn is_retriable(&self) -> bool {
-        match self.status {
-            StatusCode::TOO_MANY_REQUESTS
-            | StatusCode::BAD_GATEWAY
-            | StatusCode::SERVICE_UNAVAILABLE
-            | StatusCode::GATEWAY_TIMEOUT => true,
-            StatusCode::LOCKED => self.retry_after.is_some(),
-            _ => false,
-        }
+        status_is_retriable(self.status, self.retry_after)
+    }
+}
+
+/// The retriable-by-default rule behind [`ApiError::is_retriable`], as a pure
+/// function of the status and any `Retry-After`, so the retry loop can apply
+/// it before (or without) reading the response body.
+pub(crate) fn status_is_retriable(status: StatusCode, retry_after: Option<Duration>) -> bool {
+    match status {
+        StatusCode::TOO_MANY_REQUESTS
+        | StatusCode::BAD_GATEWAY
+        | StatusCode::SERVICE_UNAVAILABLE
+        | StatusCode::GATEWAY_TIMEOUT => true,
+        StatusCode::LOCKED => retry_after.is_some(),
+        _ => false,
     }
 }
 
