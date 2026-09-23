@@ -50,6 +50,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   over returns every attempt (endpoint, outcome, whether it rotated) and the
   final attempt's own error. `FailoverTrace::proves_not_processed()` says
   whether nothing was applied anywhere.
+- `AttemptTrace` and `AttemptTrace::of(&response)`: every response `send`
+  returns carries, in its extensions, the attempts of the call that asked for
+  another try (endpoint, outcome, whether it rotated), with
+  `proves_not_processed()`. When the budget runs out on an accepted status,
+  that response is listed last, so a caller can prove no endpoint processed
+  the request on the success path too. No existing signature changes.
 - `spec/fixtures/endpoint-failover-v1.json`: the cross-language fixture for the
   failover rules, run on a virtual clock and over real HTTP.
 

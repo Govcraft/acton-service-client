@@ -12,8 +12,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use acton_service_client::{
-    ClientError, Endpoint, EndpointOrigin, EndpointSetError, Method, RetryObserver, RetryPolicy,
-    RetryReason, ServiceClient, StatusCode, reqwest,
+    AttemptTrace, ClientError, Endpoint, EndpointOrigin, EndpointSetError, Method, RetryObserver,
+    RetryPolicy, RetryReason, ServiceClient, StatusCode, TracedAttempt, reqwest,
 };
 use axum::http::{HeaderMap, HeaderValue, StatusCode as AxumStatus};
 use axum::response::{IntoResponse, Redirect};
@@ -175,6 +175,17 @@ fn last_error(error: &ClientError) -> fixture::LastError {
     }
 }
 
+fn fixture_trace(client: &ServiceClient, attempts: &[TracedAttempt]) -> Vec<fixture::Traced> {
+    attempts
+        .iter()
+        .map(|a| fixture::Traced {
+            endpoint: index_of(client, &a.endpoint),
+            outcome: fixture::Reason::from_label(a.outcome.label()),
+            rotated: a.rotated,
+        })
+        .collect()
+}
+
 fn observed(
     client: &ServiceClient,
     result: Result<reqwest::Response, ClientError>,
@@ -182,6 +193,12 @@ fn observed(
     match result {
         Ok(response) => fixture::CallOutcome::Ok {
             status: response.status().as_u16(),
+            attempts: fixture_trace(
+                client,
+                &AttemptTrace::of(&response)
+                    .expect("send attaches the attempt trace")
+                    .attempts,
+            ),
         },
         Err(ClientError::DeadlineExceeded { attempts, .. }) => {
             fixture::CallOutcome::DeadlineExceeded { attempts }
@@ -190,15 +207,7 @@ fn observed(
             fixture::CallOutcome::Reset
         }
         Err(ClientError::EndpointsExhausted(trace)) => fixture::CallOutcome::EndpointsExhausted {
-            attempts: trace
-                .attempts
-                .iter()
-                .map(|a| fixture::Traced {
-                    endpoint: index_of(client, &a.endpoint),
-                    outcome: fixture::Reason::from_label(a.outcome.label()),
-                    rotated: a.rotated,
-                })
-                .collect(),
+            attempts: fixture_trace(client, &trace.attempts),
             last: last_error(&trace.last),
             proves_not_processed: trace.proves_not_processed(),
         },
@@ -713,4 +722,73 @@ async fn single_endpoint_client_reports_every_resend_as_a_retry() {
         ],
         "a single endpoint re-sends in place: retries only, never a rotation"
     );
+}
+
+#[tokio::test]
+async fn accepted_exhaustion_returns_the_trace_on_the_response() {
+    let (first, first_hits) = constant(AxumStatus::MISDIRECTED_REQUEST).await;
+    let dead = refused::Refused::bind();
+    let (third, third_hits) = constant(AxumStatus::MISDIRECTED_REQUEST).await;
+    let client = ServiceClient::builder(first)
+        .failover_endpoints([dead.url(), third])
+        .retry(RetryPolicy::with_max_attempts(3).deadline(Duration::from_secs(5)))
+        .build()
+        .unwrap();
+
+    let response = client
+        .request(Method::POST, "authorize")
+        .retriable(true)
+        .retry_on_status(StatusCode::MISDIRECTED_REQUEST)
+        .accept_status(StatusCode::MISDIRECTED_REQUEST)
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::MISDIRECTED_REQUEST);
+    let trace = AttemptTrace::of(&response).expect("send attaches the attempt trace");
+    let listed: Vec<(usize, RetryReason, bool)> = trace
+        .attempts
+        .iter()
+        .map(|a| (index_of(&client, &a.endpoint), a.outcome, a.rotated))
+        .collect();
+    let misdirected = RetryReason::Status(StatusCode::MISDIRECTED_REQUEST);
+    assert_eq!(
+        listed,
+        vec![
+            (0, misdirected, true),
+            (1, RetryReason::Connect, true),
+            (2, misdirected, false),
+        ]
+    );
+    assert!(
+        trace.proves_not_processed(),
+        "421, connect, 421: nothing was processed"
+    );
+    assert_eq!(*first_hits.lock().unwrap(), 1);
+    assert_eq!(*third_hits.lock().unwrap(), 1);
+}
+
+#[tokio::test]
+async fn every_response_send_returns_carries_its_trace() {
+    let (misdirected, _) = constant(AxumStatus::MISDIRECTED_REQUEST).await;
+    let (healthy, _) = constant(AxumStatus::OK).await;
+
+    let direct = ServiceClient::builder(healthy.clone()).build().unwrap();
+    let response = direct.request(Method::GET, "orders").send().await.unwrap();
+    let trace = AttemptTrace::of(&response).expect("a trace on a single endpoint too");
+    assert!(trace.attempts.is_empty(), "the first attempt answered");
+    assert!(trace.proves_not_processed());
+
+    let set = retrying_set(&misdirected, &healthy);
+    let response = set
+        .request(Method::GET, "orders")
+        .retry_on_status(StatusCode::MISDIRECTED_REQUEST)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let trace = AttemptTrace::of(&response).unwrap();
+    assert_eq!(trace.attempts.len(), 1, "the 421 before the success");
+    assert_eq!(index_of(&set, &trace.attempts[0].endpoint), 0);
+    assert!(trace.attempts[0].rotated);
 }

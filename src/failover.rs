@@ -683,6 +683,96 @@ pub struct TracedAttempt {
     pub rotated: bool,
 }
 
+/// The attempts behind a response that [`send`](crate::RequestBuilder::send)
+/// returned, read from it with [`AttemptTrace::of`].
+///
+/// Every response `send` returns carries one in its extensions. It lists, in
+/// the order sent, every attempt of the call whose outcome asked for another
+/// try (a rotation or a retry), and nothing else: a response that came back on
+/// the first attempt has an empty trace, and a success after failing over
+/// lists the attempts before it. When the budget ran out on an
+/// [accepted](crate::RequestBuilder::accept_status) status that asks for
+/// another try, that returned response is an attempt like any other, so it is
+/// listed last; this is the success-path counterpart of
+/// [`ClientError::EndpointsExhausted`]'s [`FailoverTrace`].
+///
+/// # Examples
+///
+/// ```no_run
+/// use acton_service_client::{AttemptTrace, Method, ServiceClient, StatusCode};
+/// # async fn run(client: ServiceClient) -> Result<(), acton_service_client::ClientError> {
+/// let response = client
+///     .request(Method::POST, "authorize")
+///     .retriable(true)
+///     .retry_on_status(StatusCode::MISDIRECTED_REQUEST)
+///     .accept_status(StatusCode::MISDIRECTED_REQUEST)
+///     .send()
+///     .await?;
+/// if response.status() == StatusCode::MISDIRECTED_REQUEST
+///     && AttemptTrace::of(&response).is_some_and(AttemptTrace::proves_not_processed)
+/// {
+///     // Every endpoint refused it: nothing was applied anywhere.
+/// }
+/// # Ok(())
+/// # }
+/// ```
+#[non_exhaustive]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AttemptTrace {
+    /// Every attempt that asked for another try, in the order sent.
+    pub attempts: Vec<TracedAttempt>,
+    /// Time spent inside the call.
+    pub elapsed: Duration,
+}
+
+impl AttemptTrace {
+    /// The trace carried by a response that
+    /// [`send`](crate::RequestBuilder::send) returned; `None` for a response
+    /// from anywhere else.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use acton_service_client::{AttemptTrace, Method, ServiceClient};
+    /// # async fn run(client: ServiceClient) -> Result<(), acton_service_client::ClientError> {
+    /// let response = client.request(Method::GET, "orders/7").send().await?;
+    /// let failed_over = AttemptTrace::of(&response).is_some_and(|t| !t.attempts.is_empty());
+    /// # let _ = failed_over;
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[must_use]
+    pub fn of(response: &reqwest::Response) -> Option<&Self> {
+        response.extensions().get::<Self>()
+    }
+
+    /// Whether every listed attempt's outcome proves its endpoint did not
+    /// process the request (see [`RetryReason::proves_not_processed`]); true
+    /// for an empty trace.
+    ///
+    /// When the returned response is itself listed (the budget ran out on an
+    /// accepted status), true means no endpoint processed the request.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use acton_service_client::{AttemptTrace, Method, ServiceClient};
+    /// # async fn run(client: ServiceClient) -> Result<(), acton_service_client::ClientError> {
+    /// let response = client.request(Method::GET, "orders/7").send().await?;
+    /// let earlier_attempts_unprocessed =
+    ///     AttemptTrace::of(&response).is_some_and(AttemptTrace::proves_not_processed);
+    /// # let _ = earlier_attempts_unprocessed;
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[must_use]
+    pub fn proves_not_processed(&self) -> bool {
+        self.attempts
+            .iter()
+            .all(|attempt| attempt.outcome.proves_not_processed())
+    }
+}
+
 /// Validate the failover endpoints against the base URL's `primary` origin,
 /// returning every origin in order (the primary first).
 ///
@@ -1030,7 +1120,21 @@ impl Failover {
         }
     }
 
-    /// The trace of this call, naming endpoints by `origins`.
+    /// The attempts traced so far, naming endpoints by `origins`.
+    fn traced(&self, origins: &[EndpointOrigin]) -> Vec<TracedAttempt> {
+        self.trace
+            .iter()
+            .filter_map(|entry| {
+                Some(TracedAttempt {
+                    endpoint: origins.get(entry.endpoint)?.clone(),
+                    outcome: entry.outcome,
+                    rotated: entry.rotated,
+                })
+            })
+            .collect()
+    }
+
+    /// The trace of a call that ends in `last`, naming endpoints by `origins`.
     pub(crate) fn trace(
         &self,
         origins: &[EndpointOrigin],
@@ -1038,18 +1142,21 @@ impl Failover {
         elapsed: Duration,
     ) -> FailoverTrace {
         FailoverTrace {
-            attempts: self
-                .trace
-                .iter()
-                .filter_map(|entry| {
-                    Some(TracedAttempt {
-                        endpoint: origins.get(entry.endpoint)?.clone(),
-                        outcome: entry.outcome,
-                        rotated: entry.rotated,
-                    })
-                })
-                .collect(),
+            attempts: self.traced(origins),
             last,
+            elapsed,
+        }
+    }
+
+    /// The trace of a call that returns a response, naming endpoints by
+    /// `origins`.
+    pub(crate) fn attempt_trace(
+        &self,
+        origins: &[EndpointOrigin],
+        elapsed: Duration,
+    ) -> AttemptTrace {
+        AttemptTrace {
+            attempts: self.traced(origins),
             elapsed,
         }
     }
@@ -1502,9 +1609,23 @@ mod tests {
         Reset,
     }
 
-    fn sim_outcome(sim: Sim) -> fixture::CallOutcome {
+    /// The failover's trace so far, in fixture form.
+    fn fixture_trace(failover: &Failover, origins: &[EndpointOrigin]) -> Vec<fixture::Traced> {
+        failover
+            .attempt_trace(origins, Duration::ZERO)
+            .attempts
+            .iter()
+            .map(|a| fixture::Traced {
+                endpoint: origins.iter().position(|o| *o == a.endpoint).unwrap(),
+                outcome: fixture_reason(a.outcome),
+                rotated: a.rotated,
+            })
+            .collect()
+    }
+
+    fn sim_outcome(sim: Sim, attempts: Vec<fixture::Traced>) -> fixture::CallOutcome {
         match sim {
-            Sim::Accepted(status) => fixture::CallOutcome::Ok { status },
+            Sim::Accepted(status) => fixture::CallOutcome::Ok { status, attempts },
             Sim::Api(status) => fixture::CallOutcome::Api { status },
             Sim::Transport(reason) => fixture::CallOutcome::Transport { reason },
             Sim::Reset => fixture::CallOutcome::Reset,
@@ -1548,20 +1669,12 @@ mod tests {
                     stop, last,
                 ) {
                     (Stop::Raw, Some(sim)) | (Stop::Exhausted, Some(sim @ Sim::Accepted(_))) => {
-                        sim_outcome(sim)
+                        sim_outcome(sim, fixture_trace(failover, &origins))
                     }
                     (Stop::Exhausted, Some(sim)) => {
                         let trace =
                             failover.trace(&origins, ClientError::Config(String::new()), clock);
-                        let attempts = trace
-                            .attempts
-                            .iter()
-                            .map(|a| fixture::Traced {
-                                endpoint: origins.iter().position(|o| *o == a.endpoint).unwrap(),
-                                outcome: fixture_reason(a.outcome),
-                                rotated: a.rotated,
-                            })
-                            .collect();
+                        let attempts = fixture_trace(failover, &origins);
                         let last = match sim {
                             Sim::Api(status) => fixture::LastError::Api { status },
                             Sim::Transport(reason) => fixture::LastError::Transport { reason },
@@ -1607,7 +1720,10 @@ mod tests {
                             let code = fixture::status(status);
                             if code.is_success() {
                                 preferred = attempt.endpoint;
-                                break fixture::CallOutcome::Ok { status };
+                                break fixture::CallOutcome::Ok {
+                                    status,
+                                    attempts: fixture_trace(&failover, &origins),
+                                };
                             }
                             let accepted = scenario.request.accept_status.contains(&status);
                             let retry_after = retry_after_s.map(Duration::from_secs);

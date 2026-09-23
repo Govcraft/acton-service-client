@@ -482,7 +482,7 @@ impl RequestBuilder {
                     let status = resp.status();
                     if status.is_success() {
                         inner.prefer(attempt.endpoint);
-                        return Ok(resp);
+                        return Ok(self.traced(resp, &failover, started));
                     }
                     let retry_after = parse_retry_after(resp.headers());
                     let accepted = self.accept_extra.contains(&status);
@@ -527,7 +527,10 @@ impl RequestBuilder {
         started: Instant,
     ) -> Result<reqwest::Response, ClientError> {
         match (stop, last) {
-            (Stop::Raw, Some(result)) | (Stop::Exhausted, Some(result @ Ok(_))) => result,
+            (Stop::Raw | Stop::Exhausted | Stop::NothingSent, Some(Ok(resp))) => {
+                Ok(self.traced(resp, failover, started))
+            }
+            (Stop::Raw, Some(result)) => result,
             (Stop::Exhausted, Some(Err(error))) => Err(ClientError::EndpointsExhausted(Box::new(
                 failover.trace(&self.client.inner.origins, error, started.elapsed()),
             ))),
@@ -539,6 +542,18 @@ impl RequestBuilder {
             }
             (Stop::NothingSent, Some(result)) => result,
         }
+    }
+
+    /// `resp`, carrying the [`AttemptTrace`](crate::AttemptTrace) of the call that returns it.
+    fn traced(
+        &self,
+        mut resp: reqwest::Response,
+        failover: &Failover,
+        started: Instant,
+    ) -> reqwest::Response {
+        let trace = failover.attempt_trace(&self.client.inner.origins, started.elapsed());
+        resp.extensions_mut().insert(trace);
+        resp
     }
 
     /// The absolute deadline for this send: the per-request override, else the

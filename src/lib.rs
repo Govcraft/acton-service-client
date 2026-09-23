@@ -96,7 +96,8 @@
 //! [`RetryPolicy`]. The next call starts at the endpoint that last answered
 //! ([`ServiceClient::preferred_endpoint`]). A call that runs out of budget after
 //! failing over returns [`ClientError::EndpointsExhausted`] with a
-//! [`FailoverTrace`] of every attempt, and [`RetryReason::proves_not_processed`]
+//! [`FailoverTrace`] of every attempt (a returned response carries its own
+//! [`AttemptTrace`]), and [`RetryReason::proves_not_processed`]
 //! tells a caller whether anything may have been applied. A
 //! [`RetryObserver`] hears of every re-send, rotation or same-endpoint retry,
 //! and is the metrics seam. A client with one endpoint behaves
@@ -152,8 +153,8 @@ pub use context::{
 };
 pub use error::{ApiError, ClientError, ErrorResponse, RateLimitInfo};
 pub use failover::{
-    Endpoint, EndpointOrigin, EndpointSetError, FailoverTrace, RetryObserver, RetryReason,
-    TracedAttempt,
+    AttemptTrace, Endpoint, EndpointOrigin, EndpointSetError, FailoverTrace, RetryObserver,
+    RetryReason, TracedAttempt,
 };
 pub use health::{DependencyStatus, HealthResponse, ReadinessResponse};
 pub use request::RequestBuilder;

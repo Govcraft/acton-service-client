@@ -263,7 +263,10 @@ match client
 - **Stays in the set.** A built client follows redirects only within the set;
   a supplied client that follows one out of it fails with `ClientError::Config`.
 - **Diagnosable.** Running out of budget after a rotation returns
-  `EndpointsExhausted` with the trace. `RetryReason::proves_not_processed`
+  `EndpointsExhausted` with the trace. Every response `send` returns carries
+  its own trace too, read with `AttemptTrace::of(&response)`: the attempts
+  that asked for another try, ending with the response itself when the budget
+  ran out on an accepted status. `RetryReason::proves_not_processed`
   is true only for a connect failure and `421`.
 - **Metrics.** A `RetryObserver` hears of every re-send: `on_rotation` when
   the call moves to the next endpoint, `on_retry` when it re-sends to the same

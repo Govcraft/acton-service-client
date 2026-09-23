@@ -160,6 +160,8 @@ pub enum Observed {
 pub enum CallOutcome {
     Ok {
         status: u16,
+        /// The trace the returned response carries.
+        attempts: Vec<Traced>,
     },
     Api {
         status: u16,
