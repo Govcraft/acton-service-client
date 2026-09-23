@@ -47,7 +47,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   that request's re-sends, every attempt but the last exactly once, in order,
   with its outcome, so its reports plus the request's result are the complete
   per-attempt record of that call, even with concurrent requests on the same
-  client.
+  client. It is the only record on the paths that carry no trace:
+  `DeadlineExceeded`, and errors returned as they are (a single endpoint's,
+  or a call that never rotated).
 - `ClientError::InvalidEndpoints(EndpointSetError)`: a duplicate origin after
   normalization, mixed schemes, or a failover endpoint that is not a bare
   origin is a typed build error, never a panic.

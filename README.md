@@ -287,6 +287,12 @@ match client
   across concurrent requests, which is right for counters and wrong for
   deciding what happened to one call. To derive a per-call answer (such as
   "not submitted anywhere"), install a fresh collector on that request.
+- **Where the record lives.** An `Ok` response carries its attempts in
+  `AttemptTrace::of(&response)`. `EndpointsExhausted` carries every attempt in
+  its `FailoverTrace`. `DeadlineExceeded` and every other error (a single
+  endpoint's, or a call that never rotated, returned exactly as in 0.2.0) carry
+  no trace: the request's own observer is the record there, and it covers the
+  other paths too.
 - **Parity.** `spec/fixtures/endpoint-failover-v1.json` pins the rules for
   every port; the Rust crate runs it on a virtual clock and over real HTTP.
 

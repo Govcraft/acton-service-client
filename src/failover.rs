@@ -427,6 +427,20 @@ impl fmt::Display for RetryReason {
 /// [prove it](RetryReason::proves_not_processed), no endpoint processed the
 /// request.
 ///
+/// # Where each result's record lives
+///
+/// | `send` returns | Every attempt before the last | The last attempt |
+/// |---|---|---|
+/// | `Ok(response)`, any path | [`AttemptTrace::of`] on the response, and the request's observer | the response |
+/// | `Err(`[`ClientError::EndpointsExhausted`]`)` | the error's [`FailoverTrace`], and the request's observer | the trace's `last` |
+/// | `Err(`[`ClientError::DeadlineExceeded`]`)` | the request's observer (`attempts == 0`: nothing was sent) | none |
+/// | any other `Err` (`Api`, `Transport`, ...) | the request's observer only | the error |
+///
+/// The last row is the single-endpoint path, and a set's call that never
+/// rotated: the error is returned exactly as 0.2.0 returns it, with no trace.
+/// A request that must prove what happened to it on every path (for example
+/// that no endpoint processed it) installs its own observer.
+///
 /// # Recommended wiring for an `acton-service` application
 ///
 /// Count both on the service's own meter provider, labelled by reason, as two

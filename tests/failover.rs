@@ -107,20 +107,9 @@ async fn resetting_endpoint(index: usize, at: Break, log: Log) -> String {
         while let Ok((mut stream, _)) = listener.accept().await {
             let log = log.clone();
             tokio::spawn(async move {
-                let mut head = Vec::new();
-                let mut buf = [0_u8; 4096];
-                while !head.windows(4).any(|w| w == b"\r\n\r\n") {
-                    match stream.read(&mut buf).await {
-                        Ok(0) | Err(_) => return,
-                        Ok(n) => head.extend_from_slice(&buf[..n]),
-                    }
-                }
-                let head = String::from_utf8_lossy(&head).to_ascii_lowercase();
-                let call = head
-                    .lines()
-                    .find_map(|line| line.strip_prefix(CALL_HEADER)?.strip_prefix(':'))
-                    .and_then(|value| value.trim().parse().ok())
-                    .unwrap_or(0);
+                let Some(call) = read_head(&mut stream).await else {
+                    return;
+                };
                 log.lock().unwrap().push((call, index));
                 if let Break::MidResponseBody = at {
                     let partial = b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
@@ -132,6 +121,91 @@ async fn resetting_endpoint(index: usize, at: Break, log: Log) -> String {
                 }
                 stream.set_zero_linger().unwrap();
             });
+        }
+    });
+    format!("http://{addr}")
+}
+
+/// Read a request head off `stream` and return its fixture call, or `None`
+/// when the connection closes first.
+async fn read_head(stream: &mut tokio::net::TcpStream) -> Option<usize> {
+    let mut head = Vec::new();
+    let mut buf = [0_u8; 4096];
+    while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+        match stream.read(&mut buf).await {
+            Ok(0) | Err(_) => return None,
+            Ok(n) => head.extend_from_slice(&buf[..n]),
+        }
+    }
+    let head = String::from_utf8_lossy(&head).to_ascii_lowercase();
+    Some(
+        head.lines()
+            .find_map(|line| line.strip_prefix(CALL_HEADER)?.strip_prefix(':'))
+            .and_then(|value| value.trim().parse().ok())
+            .unwrap_or(0),
+    )
+}
+
+/// Take over `addr` once its listener is gone, so the origin that was
+/// answering refuses from then on: the socket is bound but never listens, so
+/// the kernel resets every connection and no other socket can take the port.
+/// `SO_REUSEADDR` lets the bind succeed while the closed connections to it sit
+/// in `TIME_WAIT`.
+fn refuse_at(addr: std::net::SocketAddr) -> tokio::net::TcpSocket {
+    let socket = tokio::net::TcpSocket::new_v4().expect("a TCP socket");
+    socket.set_reuseaddr(true).expect("SO_REUSEADDR");
+    socket.bind(addr).expect("the address its listener left");
+    socket
+}
+
+/// Answer `statuses` in order, one connection each (`connection: close`, so
+/// no attempt rides a pooled connection), then refuse every connection. The
+/// listener is replaced by a refusing socket, kept in `held`, before the last
+/// answer is written, so no later attempt can reach a listener.
+async fn closing_endpoint(
+    index: usize,
+    statuses: Vec<(u16, Option<u64>, u64)>,
+    log: Log,
+    held: Arc<Mutex<Vec<tokio::net::TcpSocket>>>,
+) -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let mut listener = Some(listener);
+        let count = statuses.len();
+        for (n, (status, retry_after_s, latency)) in statuses.into_iter().enumerate() {
+            let Some(accepting) = listener.as_ref() else {
+                return;
+            };
+            let Ok((mut stream, _)) = accepting.accept().await else {
+                return;
+            };
+            let Some(call) = read_head(&mut stream).await else {
+                return;
+            };
+            log.lock().unwrap().push((call, index));
+            if n + 1 == count {
+                drop(listener.take());
+                held.lock().unwrap().push(refuse_at(addr));
+            }
+            tokio::time::sleep(Duration::from_millis(latency)).await;
+            let body = format!(r#"{{"error":"scripted","status":{status}}}"#);
+            let retry_after =
+                retry_after_s.map_or(String::new(), |s| format!("retry-after: {s}\r\n"));
+            let response = format!(
+                "HTTP/1.1 {status} {}\r\ncontent-type: application/json\r\n\
+                 content-length: {}\r\nconnection: close\r\n{retry_after}\r\n{body}",
+                AxumStatus::from_u16(status)
+                    .unwrap()
+                    .canonical_reason()
+                    .unwrap_or("Scripted"),
+                body.len(),
+            );
+            if stream.write_all(response.as_bytes()).await.is_err() {
+                return;
+            }
+            // The client has its answer; a failed close changes nothing.
+            stream.shutdown().await.ok();
         }
     });
     format!("http://{addr}")
@@ -348,6 +422,44 @@ fn tally(reports: impl IntoIterator<Item = fixture::Observed>) -> Vec<String> {
     all
 }
 
+/// The answers of an endpoint that answers and then refuses, in call order:
+/// every status must come before its first `connect`.
+fn answers_then_refuses(
+    name: &str,
+    scenario: &fixture::Scenario,
+    script: Scripts,
+) -> Vec<(u16, Option<u64>, u64)> {
+    assert!(
+        !scenario.concurrent,
+        "{name}: concurrent calls leave no order to stop answering in"
+    );
+    let mut calls: Vec<_> = script.into_iter().collect();
+    calls.sort_by_key(|&(call, _)| call);
+    let results: Vec<_> = calls.into_iter().flat_map(|(_, queue)| queue).collect();
+    let answering = results
+        .iter()
+        .take_while(|(r, _)| *r != fixture::ScriptedResult::Connect)
+        .count();
+    assert!(
+        results[answering..]
+            .iter()
+            .all(|(r, _)| *r == fixture::ScriptedResult::Connect),
+        "{name}: an endpoint that stops answering refuses from then on"
+    );
+    results[..answering]
+        .iter()
+        .map(|&(result, latency)| match result {
+            fixture::ScriptedResult::Status {
+                status,
+                retry_after_s,
+            } => (status, retry_after_s, latency),
+            other => {
+                panic!("{name}: an endpoint that stops answering answers statuses, not {other:?}")
+            }
+        })
+        .collect()
+}
+
 async fn run_scenario(scenario: &fixture::Scenario) {
     let name = &scenario.name;
     let mut scripts: Vec<Scripts> = vec![HashMap::new(); scenario.endpoints];
@@ -362,6 +474,7 @@ async fn run_scenario(scenario: &fixture::Scenario) {
     let log: Log = Arc::default();
     let mut urls = Vec::new();
     let mut dead = Vec::new();
+    let closed: Arc<Mutex<Vec<tokio::net::TcpSocket>>> = Arc::default();
     for (index, script) in scripts.into_iter().enumerate() {
         let results: Vec<fixture::ScriptedResult> =
             script.values().flatten().map(|&(r, _)| r).collect();
@@ -379,16 +492,19 @@ async fn run_scenario(scenario: &fixture::Scenario) {
             resetting_endpoint(index, Break::AfterRequestHead, log.clone()).await
         } else if connects == 0 {
             scripted_endpoint(index, script, log.clone()).await
-        } else {
-            assert_eq!(
-                connects,
-                results.len(),
-                "{name}: a dead endpoint only refuses"
-            );
+        } else if connects == results.len() {
             let refused = refused::Refused::bind();
             let url = refused.url();
             dead.push(refused);
             url
+        } else {
+            closing_endpoint(
+                index,
+                answers_then_refuses(name, scenario, script),
+                log.clone(),
+                closed.clone(),
+            )
+            .await
         });
     }
 

@@ -5,7 +5,7 @@
     "units": "Durations are whole milliseconds (_ms) or whole seconds (_s, Retry-After only).",
     "reason_shape": "A rotation reason / attempt outcome is {\"kind\":\"status\",\"status\":N} | {\"kind\":\"connect\"} | {\"kind\":\"timeout\"}.",
     "validation": "Endpoint 0 is the base URL; failover endpoints are numbered from 1. Each failover endpoint is checked in order: a bare http(s) origin (not_an_origin), then the base URL's scheme (mixed_scheme), then a new origin once normalized (duplicate_origin). The first failure is the error. Origins display as scheme://host:port with the default port filled in.",
-    "scenarios": "Each scenario is a sequence of calls on one client, sharing its sticky preference; a scenario marked 'concurrent' sends all its calls at once instead, and is built so that each call's path does not depend on the interleaving. Each call lists every attempt in send order: the endpoint the client must choose, the scripted result, the time it takes (latency_ms, default 1; a stall takes the attempt timeout), and, for every attempt but a call's last, when the next attempt goes out ('now', or 'after' a pause). A virtual clock starts at 0 for each call; time advances only by attempt time and pauses. 'draws' (jitter 'full' scenarios only) feed the jitter draw, one per computed (non Retry-After) pause, in order; with jitter 'none' the draw is unused and no draws are listed. 'observed' is every call of the retry observer, in order: a rotation (the endpoint left and the reason) or a retry (the endpoint re-sent to, the reason, and the number of the attempt about to be sent, counted over the call). A 'reset' result is a transport failure after the request was written (a connection reset mid-body): neither connect nor timeout, so it is returned as it is ('reset' outcome) and never retried. 'outcome' is the call's result; for endpoints_exhausted, 'attempts' is the full trace and 'last' the final attempt's own error. For ok, 'attempts' is the trace the returned response carries: every attempt whose outcome asked for another try (a rotation or a retry), in send order, so empty when the first attempt answered, and ending with the returned response itself when the budget ran out on an accepted status that asks for another try. An endpoint whose results are 'connect' is refused on every attempt.",
+    "scenarios": "Each scenario is a sequence of calls on one client, sharing its sticky preference; a scenario marked 'concurrent' sends all its calls at once instead, and is built so that each call's path does not depend on the interleaving. Each call lists every attempt in send order: the endpoint the client must choose, the scripted result, the time it takes (latency_ms, default 1; a stall takes the attempt timeout), and, for every attempt but a call's last, when the next attempt goes out ('now', or 'after' a pause). A virtual clock starts at 0 for each call; time advances only by attempt time and pauses. 'draws' (jitter 'full' scenarios only) feed the jitter draw, one per computed (non Retry-After) pause, in order; with jitter 'none' the draw is unused and no draws are listed. 'observed' is every call of the retry observer, in order: a rotation (the endpoint left and the reason) or a retry (the endpoint re-sent to, the reason, and the number of the attempt about to be sent, counted over the call). A 'reset' result is a transport failure after the request was written (a connection reset mid-body): neither connect nor timeout, so it is returned as it is ('reset' outcome) and never retried. 'outcome' is the call's result; for endpoints_exhausted, 'attempts' is the full trace and 'last' the final attempt's own error. For ok, 'attempts' is the trace the returned response carries: every attempt whose outcome asked for another try (a rotation or a retry), in send order, so empty when the first attempt answered, and ending with the returned response itself when the budget ran out on an accepted status that asks for another try. An endpoint refuses connections from its first 'connect' result on: its results, in call order, are any statuses first and then only 'connect'.",
     "decision_rules": [
       "Rotation outcomes: a status in retry_on_status (checked before accept_status), a connect failure, an attempt timeout. Other statuses retriable by default (429, 502, 503, 504; 423 only with Retry-After) and not accepted retry the SAME endpoint. Everything else ends the call.",
       "Nothing is retried unless a policy is set and the method is idempotent (GET, HEAD, DELETE, PUT) or the request is marked retriable.",
@@ -291,6 +291,29 @@
           "observed": [
             { "kind": "retry", "endpoint": 0, "reason": { "kind": "connect" }, "attempt": 2 },
             { "kind": "retry", "endpoint": 0, "reason": { "kind": "connect" }, "attempt": 3 }
+          ],
+          "outcome": { "kind": "transport", "reason": { "kind": "connect" } },
+          "preferred_after": 0
+        }
+      ]
+    },
+    {
+      "name": "single_endpoint_answers_then_refuses_returns_the_connect_error",
+      "about": "One endpoint answers 421, then 503, then stops listening. Both statuses retry in place (421 is listed, 503 is retriable by default), the refused third attempt spends the budget, and the connect error comes back as it is with no trace, exactly as 0.2.0. The request's own observer is the only record of the two answers; the 503's reason does not prove the request unprocessed.",
+      "endpoints": 1,
+      "policy": { "max_attempts": 3, "base_delay_ms": 50, "max_delay_ms": 1600, "jitter": "none", "deadline_ms": null },
+      "request": { "method": "POST", "retriable": true, "retry_on_status": [421] },
+      "calls": [
+        {
+          "preferred_before": 0,
+          "attempts": [
+            { "endpoint": 0, "result": { "kind": "status", "status": 421 }, "next": { "kind": "after", "pause_ms": 50 } },
+            { "endpoint": 0, "result": { "kind": "status", "status": 503 }, "next": { "kind": "after", "pause_ms": 100 } },
+            { "endpoint": 0, "result": { "kind": "connect" } }
+          ],
+          "observed": [
+            { "kind": "retry", "endpoint": 0, "reason": { "kind": "status", "status": 421 }, "attempt": 2 },
+            { "kind": "retry", "endpoint": 0, "reason": { "kind": "status", "status": 503 }, "attempt": 3 }
           ],
           "outcome": { "kind": "transport", "reason": { "kind": "connect" } },
           "preferred_after": 0
