@@ -5,7 +5,64 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.2.0] - Unreleased
+## [0.2.1] - Unreleased
+
+### Added
+
+- **Endpoint failover under one deadline.** `ServiceClientBuilder::failover_endpoint`
+  and `failover_endpoints` add endpoints after the base URL to form an ordered
+  endpoint set. When retries apply to a request (a policy is set and the method
+  is idempotent or the request is `.retriable(true)`), a status listed with
+  `retry_on_status`, a connect failure, or an attempt timeout moves the next
+  attempt to the next endpoint at once. After a full cycle the client pauses
+  with the policy's backoff, or the smallest `Retry-After` when every endpoint
+  in the cycle sent one. One deadline covers every attempt on every endpoint,
+  and `max_attempts` counts every send. Statuses retriable by default but not
+  listed still retry the same endpoint, and every other answer is returned as
+  before.
+- `Endpoint` (`new`, `with_http_client`, `url`, from `&str`/`String`): a
+  failover endpoint, optionally with its own HTTP client (for example its own
+  TLS configuration).
+- `ServiceClient::endpoints()` and `ServiceClient::preferred_endpoint()`. The
+  preference is sticky: the next call starts at the endpoint that last gave a
+  definitive answer (any status that is not a rotation status, a `4xx`
+  included); transport failures and rotation statuses never move it.
+- `EndpointOrigin`: a normalized `scheme://host:port` origin.
+- `RotationReason` (`Status`, `Connect`, `Timeout`) with `label()` for metrics
+  and `proves_not_processed()` (true only for `Connect` and `Status(421)`).
+- `RotationObserver` and `ServiceClientBuilder::rotation_observer`: called on
+  every rotation with the endpoint left and the reason. It is the metrics seam;
+  the crate takes no metrics dependency.
+- `ClientError::InvalidEndpoints(EndpointSetError)`: a duplicate origin after
+  normalization, mixed schemes, or a failover endpoint that is not a bare
+  origin is a typed build error, never a panic.
+- `ClientError::EndpointsExhausted(Box<FailoverTrace>)` and
+  `ClientError::failover_trace()`: a call that runs out of budget after failing
+  over returns every attempt (endpoint, outcome, whether it rotated) and the
+  final attempt's own error. `FailoverTrace::proves_not_processed()` says
+  whether nothing was applied anywhere.
+- `spec/fixtures/endpoint-failover-v1.json`: the cross-language fixture for the
+  failover rules, run on a virtual clock and over real HTTP.
+
+### Changed
+
+- A client with several endpoints that this crate builds follows redirects
+  only to origins in the set. A supplied client that follows a redirect out of
+  the set fails the call with `ClientError::Config`. Single-endpoint clients
+  are unchanged.
+- `ClientError::DeadlineExceeded` is documented as "the deadline expired;
+  `attempts` requests were started; any of them may have been applied". Only
+  `attempts == 0` guarantees nothing was sent. Its message now says which case
+  applies. Behaviour is unchanged: it is still returned only with
+  `attempts == 0`.
+
+### Migration
+
+- Purely additive. `ClientError` gains two variants, which a wildcard arm
+  already covers, since it is `#[non_exhaustive]`. A client with one endpoint
+  behaves exactly as 0.2.0.
+
+## [0.2.0] - 2026-09-22
 
 ### Added
 
@@ -34,9 +91,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `RequestBuilder::timeout(Duration)`: a per-attempt timeout override.
 - `RequestBuilder::deadline_at(Instant)`: an absolute deadline, so several
   sends of one operation share one budget.
-- `ClientError::DeadlineExceeded { attempts, elapsed }`: returned only when a
-  call's deadline has passed before anything was sent (for example, an
-  already-elapsed `deadline_at`), so the server never saw it. It is not
+- `ClientError::DeadlineExceeded { attempts, elapsed }`: the deadline expired
+  after `attempts` requests were started, and any of them may have been
+  applied; only `attempts == 0` guarantees nothing was sent. 0.2.0 returns it
+  only with `attempts == 0`, when a call's deadline has passed before its
+  first attempt (for example, an already-elapsed `deadline_at`). It is not
   retriable, and its message says to widen the deadline or re-drive the
   operation with the same idempotency identity. Once an attempt has gone out,
   running out of budget returns that attempt's own outcome instead.

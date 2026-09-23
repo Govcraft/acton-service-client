@@ -85,6 +85,35 @@
 //! # let _ = client;
 //! ```
 //!
+//! # Endpoint failover
+//!
+//! A client can hold an ordered set of endpoints serving the same API: the
+//! base URL, then each [`ServiceClientBuilder::failover_endpoint`]. When
+//! retries apply to a request, a listed [`RequestBuilder::retry_on_status`]
+//! (such as `421 Misdirected Request`), a connect failure, or an attempt
+//! timeout moves the next attempt to the next endpoint at once, all under one
+//! deadline. After a full cycle the client backs off with the
+//! [`RetryPolicy`]. The next call starts at the endpoint that last answered
+//! ([`ServiceClient::preferred_endpoint`]). A call that runs out of budget after
+//! failing over returns [`ClientError::EndpointsExhausted`] with a
+//! [`FailoverTrace`] of every attempt, and [`RotationReason::proves_not_processed`]
+//! tells a caller whether anything may have been applied. A
+//! [`RotationObserver`] is the metrics seam. A client with one endpoint behaves
+//! exactly as before. See the [`failover`] module for the full rules.
+//!
+//! ```
+//! use acton_service_client::{RetryPolicy, ServiceClient};
+//! use std::time::Duration;
+//!
+//! let client = ServiceClient::builder("https://replica-a.example.com")
+//!     .failover_endpoints(["https://replica-b.example.com", "https://replica-c.example.com"])
+//!     .attempt_timeout(Duration::from_secs(5))
+//!     .retry(RetryPolicy::default().deadline(Duration::from_secs(15)))
+//!     .build()
+//!     .expect("a valid endpoint set");
+//! assert_eq!(client.endpoints().len(), 3);
+//! ```
+//!
 //! # Custom HTTP client (mutual TLS, proxies, pools)
 //!
 //! For anything the builder does not surface — a client certificate for mutual
@@ -102,6 +131,7 @@
 
 pub mod context;
 pub mod error;
+pub mod failover;
 pub mod health;
 pub mod retry;
 pub mod url;
@@ -110,12 +140,20 @@ pub mod versioning;
 mod client;
 mod request;
 
+// Lets the fixture model shared with the integration tests name this crate.
+#[cfg(test)]
+extern crate self as acton_service_client;
+
 pub use client::{ServiceClient, ServiceClientBuilder};
 pub use context::{
     PROPAGATED_HEADERS, RequestContext, X_CLIENT_ID, X_CORRELATION_ID, X_REQUEST_ID, X_SPAN_ID,
     X_TRACE_ID,
 };
 pub use error::{ApiError, ClientError, ErrorResponse, RateLimitInfo};
+pub use failover::{
+    Endpoint, EndpointOrigin, EndpointSetError, FailoverTrace, RotationObserver, RotationReason,
+    TracedAttempt,
+};
 pub use health::{DependencyStatus, HealthResponse, ReadinessResponse};
 pub use request::RequestBuilder;
 pub use retry::{Jitter, RetryPolicy};

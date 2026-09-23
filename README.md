@@ -119,8 +119,17 @@ Every fallible call returns `ClientError`:
 - **`Decode { status, snippet, source }`** — a success body that failed to
   deserialize; keeps a truncated snippet for diagnostics.
 - **`Config(String)`** — builder-time validation (e.g. bad base URL).
-- **`DeadlineExceeded { attempts, elapsed }`** — the call's deadline passed
-  before anything was sent. Not retriable.
+- **`DeadlineExceeded { attempts, elapsed }`**: the call's deadline expired
+  after `attempts` requests were started, and any of them may have been
+  applied. Only `attempts == 0` guarantees nothing was sent (today the crate
+  returns it only in that case). Not retriable.
+- **`InvalidEndpoints(EndpointSetError)`**: the endpoint set was refused at
+  build time (duplicate origin, mixed schemes, or a failover endpoint that is
+  not a bare origin).
+- **`EndpointsExhausted(Box<FailoverTrace>)`**: a call over an endpoint set ran
+  out of budget after failing over. The trace lists every attempt (endpoint,
+  outcome, whether it rotated) and the final attempt's own error. Not
+  retriable.
 
 `ClientError` is `#[non_exhaustive]`: match it with a wildcard arm.
 
@@ -187,6 +196,73 @@ let answer: Answer = client
 
 Defaults (no deadline, no jitter, no extra statuses) behave exactly as 0.1.
 
+## Endpoint failover
+
+Give a client an ordered set of endpoints serving the same API, and one
+deadline covers every attempt on every endpoint:
+
+```rust,no_run
+# use acton_service_client::{
+#     ClientError, EndpointOrigin, Method, RetryPolicy, RotationReason, ServiceClient, StatusCode,
+# };
+# use std::time::Duration;
+# async fn run() -> Result<(), ClientError> {
+let client = ServiceClient::builder("https://replica-a.example.com")
+    .failover_endpoints(["https://replica-b.example.com", "https://replica-c.example.com"])
+    .attempt_timeout(Duration::from_secs(5))
+    .retry(RetryPolicy::default().max_attempts(u32::MAX).deadline(Duration::from_secs(15)))
+    .rotation_observer(|left: &EndpointOrigin, reason: RotationReason| {
+        eprintln!("left {left}: {}", reason.label()); // or count it as a metric
+    })
+    .build()?;
+
+match client
+    .request(Method::POST, "authorize")
+    .retriable(true)
+    .retry_on_status(StatusCode::MISDIRECTED_REQUEST)
+    .send()
+    .await
+{
+    Err(ClientError::EndpointsExhausted(trace)) if trace.proves_not_processed() => {
+        // Every endpoint refused it (421 or connect): nothing was applied.
+    }
+    other => { let _ = other?; }
+}
+# Ok(())
+# }
+```
+
+- **Validated at build.** Failover endpoints are bare origins
+  (`scheme://host[:port]`); each request reuses the base URL's path. Duplicate
+  origins (after normalization) and mixed schemes are a typed
+  `ClientError::InvalidEndpoints`, never a panic. `Endpoint::with_http_client`
+  gives one endpoint its own client (for example its own TLS configuration).
+- **Retriable requests only.** Failover follows the retry rules: idempotent
+  methods, or `.retriable(true)`. A request that is not retried goes to one
+  endpoint only, exactly as without a set.
+- **Rotation.** A `retry_on_status` status, a connect failure, or an attempt
+  timeout moves the next attempt to the next endpoint at once. After a full
+  cycle, the client pauses with the policy's backoff (or the smallest
+  `Retry-After`, when every endpoint in the cycle sent one). Statuses retriable
+  by default but not listed (`429`, `502`, `503`, `504`) retry the same
+  endpoint, and every other answer is returned, as before.
+- **Sticky.** The next call starts at the endpoint that last gave a definitive
+  answer (any status that is not a rotation status, a `4xx` included).
+- **Stays in the set.** A built client follows redirects only within the set;
+  a supplied client that follows one out of it fails with `ClientError::Config`.
+- **Diagnosable.** Running out of budget after a rotation returns
+  `EndpointsExhausted` with the trace. `RotationReason::proves_not_processed`
+  is true only for a connect failure and `421`.
+- **Metrics.** `RotationObserver` (any `Fn(&EndpointOrigin, RotationReason)`)
+  is called on every rotation; the crate has no metrics dependency. In an
+  `acton-service` application, count them on
+  `acton_service::observability::get_meter()` as
+  `acton_service_client.endpoint.rotations{reason = reason.label()}`.
+- **Parity.** `spec/fixtures/endpoint-failover-v1.json` pins the rules for
+  every port; the Rust crate runs it on a virtual clock and over real HTTP.
+
+A client with one endpoint behaves exactly as 0.2.0.
+
 ## Feature table
 
 | Area | What you get |
@@ -199,6 +275,7 @@ Defaults (no deadline, no jitter, no extra statuses) behave exactly as 0.1.
 | Rate limits | `RateLimitInfo` surfaced on `ApiError` |
 | Auth | Bearer tokens (JWT or PASETO, opaque to the client) |
 | Retries | Opt-in `RetryPolicy`: pure backoff math, floored jitter, total deadline, per-request extra statuses and timeouts |
+| Failover | Ordered endpoint set under one deadline: validated at build, sticky, in-set redirects only, typed trace on exhaustion, rotation observer |
 
 ## Development
 

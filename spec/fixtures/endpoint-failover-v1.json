@@ -1,0 +1,483 @@
+{
+  "about": {
+    "summary": "Canonical cross-language fixture for acton-service-client endpoint failover (crate 0.2.1). Every client that mirrors the failover behaviour (the Rust crate, and the TypeScript port in AxorumHQ/axorum) must reproduce every row. Consumers vendor a copy; this file is the source of truth.",
+    "version": 1,
+    "units": "Durations are whole milliseconds (_ms) or whole seconds (_s, Retry-After only).",
+    "reason_shape": "A rotation reason / attempt outcome is {\"kind\":\"status\",\"status\":N} | {\"kind\":\"connect\"} | {\"kind\":\"timeout\"}.",
+    "validation": "Endpoint 0 is the base URL; failover endpoints are numbered from 1. Each failover endpoint is checked in order: a bare http(s) origin (not_an_origin), then the base URL's scheme (mixed_scheme), then a new origin once normalized (duplicate_origin). The first failure is the error. Origins display as scheme://host:port with the default port filled in.",
+    "scenarios": "Each scenario is a sequence of calls on one client, sharing its sticky preference. Each call lists every attempt in send order: the endpoint the client must choose, the scripted result, the time it takes (latency_ms, default 1; a stall takes the attempt timeout), and, for every attempt but a call's last, when the next attempt goes out ('now', or 'after' a pause). A virtual clock starts at 0 for each call; time advances only by attempt time and pauses. 'draws' (jitter 'full' scenarios only) feed the jitter draw, one per computed (non Retry-After) pause, in order; with jitter 'none' the draw is unused and no draws are listed. 'rotations' is every call of the rotation observer, in order. 'outcome' is the call's result; for endpoints_exhausted, 'attempts' is the full trace and 'last' the final attempt's own error. An endpoint whose results are 'connect' is refused on every attempt.",
+    "decision_rules": [
+      "Rotation outcomes: a status in retry_on_status (checked before accept_status), a connect failure, an attempt timeout. Other statuses retriable by default (429, 502, 503, 504; 423 only with Retry-After) and not accepted retry the SAME endpoint. Everything else ends the call.",
+      "Nothing is retried unless a policy is set and the method is idempotent (GET, HEAD, DELETE, PUT) or the request is marked retriable.",
+      "A rotation within a cycle is immediate. After n consecutive rotations (n = set size) the client pauses: the smallest Retry-After if every rotation in the cycle carried one, else pause(k, draw, remaining) with k = pauses taken so far + 1. A same-endpoint retry resets the cycle and pauses the same way (Retry-After, else pause(k, ...)).",
+      "max_attempts counts sends: no further attempt once attempts_sent >= max_attempts. A pause that would reach the deadline is not taken.",
+      "Before each send, if the deadline has passed: deadline_exceeded with attempts 0 when nothing was sent; otherwise the budget is spent.",
+      "Budget spent (max_attempts, deadline, or refused pause): if at least one rotation was made (an attempt was actually sent to the next endpoint), endpoints_exhausted with the trace, unless the last outcome was an accepted status, which is returned as a success; otherwise the last outcome as it is.",
+      "Sticky preference: any response whose status is not a rotation status for the request moves it to that endpoint; transport failures and rotation statuses never do. The next call starts there.",
+      "The rotation observer fires when the next attempt is actually sent to the next endpoint, with the endpoint left and the reason. A single endpoint never rotates: every rotation outcome retries in place, exactly as 0.2.0."
+    ]
+  },
+  "reasons": [
+    { "reason": { "kind": "status", "status": 421 }, "label": "421", "proves_not_processed": true },
+    { "reason": { "kind": "status", "status": 503 }, "label": "503", "proves_not_processed": false },
+    { "reason": { "kind": "status", "status": 429 }, "label": "429", "proves_not_processed": false },
+    { "reason": { "kind": "connect" }, "label": "connect", "proves_not_processed": true },
+    { "reason": { "kind": "timeout" }, "label": "timeout", "proves_not_processed": false }
+  ],
+  "validation": [
+    {
+      "name": "clean_set_normalizes_in_order",
+      "base": "https://A.example/api",
+      "failover": ["https://b.example", "https://c.example:8443/"],
+      "endpoints": ["https://a.example:443", "https://b.example:443", "https://c.example:8443"]
+    },
+    {
+      "name": "single_endpoint",
+      "base": "http://a.example:8080/gateway",
+      "failover": [],
+      "endpoints": ["http://a.example:8080"]
+    },
+    {
+      "name": "duplicate_after_normalization",
+      "base": "https://a.example",
+      "failover": ["https://b.example", "HTTPS://A.EXAMPLE:443/"],
+      "error": { "kind": "duplicate_origin", "origin": "https://a.example:443", "first": 0, "duplicate": 2 }
+    },
+    {
+      "name": "duplicate_between_failovers",
+      "base": "https://a.example",
+      "failover": ["https://b.example:443", "https://B.example"],
+      "error": { "kind": "duplicate_origin", "origin": "https://b.example:443", "first": 1, "duplicate": 2 }
+    },
+    {
+      "name": "mixed_scheme",
+      "base": "https://a.example",
+      "failover": ["http://b.example"],
+      "error": { "kind": "mixed_scheme", "index": 1, "expected": "https", "found": "http" }
+    },
+    {
+      "name": "same_host_other_port_is_distinct",
+      "base": "http://127.0.0.1:8080",
+      "failover": ["http://127.0.0.1:8081"],
+      "endpoints": ["http://127.0.0.1:8080", "http://127.0.0.1:8081"]
+    },
+    {
+      "name": "path_refused",
+      "base": "https://a.example",
+      "failover": ["https://b.example/api"],
+      "error": { "kind": "not_an_origin", "index": 1, "reason": "it has a path" }
+    },
+    {
+      "name": "query_refused",
+      "base": "https://a.example",
+      "failover": ["https://b.example/?x=1"],
+      "error": { "kind": "not_an_origin", "index": 1, "reason": "it has a query" }
+    },
+    {
+      "name": "fragment_refused",
+      "base": "https://a.example",
+      "failover": ["https://b.example/#top"],
+      "error": { "kind": "not_an_origin", "index": 1, "reason": "it has a fragment" }
+    },
+    {
+      "name": "user_info_refused",
+      "base": "https://a.example",
+      "failover": ["https://user:pw@b.example"],
+      "error": { "kind": "not_an_origin", "index": 1, "reason": "it carries user info" }
+    },
+    {
+      "name": "other_scheme_refused",
+      "base": "https://a.example",
+      "failover": ["ftp://b.example"],
+      "error": { "kind": "not_an_origin", "index": 1, "reason": "its scheme must be http or https" }
+    },
+    {
+      "name": "not_a_url_refused",
+      "base": "https://a.example",
+      "failover": ["https://b.example", "not a url"],
+      "error": { "kind": "not_an_origin", "index": 2, "reason": "it is not a valid absolute URL" }
+    }
+  ],
+  "scenarios": [
+    {
+      "name": "misdirected_then_next_succeeds",
+      "about": "The addressed endpoint answers 421; the next one answers and becomes preferred.",
+      "endpoints": 2,
+      "policy": { "max_attempts": 4, "base_delay_ms": 100, "max_delay_ms": 1600, "jitter": "none", "deadline_ms": 15000 },
+      "request": { "method": "POST", "retriable": true, "retry_on_status": [421, 503] },
+      "calls": [
+        {
+          "preferred_before": 0,
+          "attempts": [
+            { "endpoint": 0, "result": { "kind": "status", "status": 421 }, "next": { "kind": "now" } },
+            { "endpoint": 1, "result": { "kind": "status", "status": 200 } }
+          ],
+          "rotations": [{ "left": 0, "reason": { "kind": "status", "status": 421 } }],
+          "outcome": { "kind": "ok", "status": 200 },
+          "preferred_after": 1
+        }
+      ]
+    },
+    {
+      "name": "dead_endpoint_is_skipped_within_one_call",
+      "about": "A refused connection rotates at once, inside the same call.",
+      "endpoints": 2,
+      "policy": { "max_attempts": 3, "base_delay_ms": 100, "max_delay_ms": 1600, "jitter": "none", "deadline_ms": 5000 },
+      "request": { "method": "GET", "retry_on_status": [421] },
+      "calls": [
+        {
+          "preferred_before": 0,
+          "attempts": [
+            { "endpoint": 0, "result": { "kind": "connect" }, "next": { "kind": "now" } },
+            { "endpoint": 1, "result": { "kind": "status", "status": 200 } }
+          ],
+          "rotations": [{ "left": 0, "reason": { "kind": "connect" } }],
+          "outcome": { "kind": "ok", "status": 200 },
+          "preferred_after": 1
+        }
+      ]
+    },
+    {
+      "name": "every_endpoint_misdirected_until_the_deadline",
+      "about": "Both endpoints answer 421 until the deadline. Cycles pause 100 then 200 ms; the third cycle pause (400 ms) would reach the deadline, so the call ends with the trace and the last 421.",
+      "endpoints": 2,
+      "policy": { "max_attempts": 4294967295, "base_delay_ms": 100, "max_delay_ms": 1600, "jitter": "none", "deadline_ms": 700 },
+      "request": { "method": "POST", "retriable": true, "retry_on_status": [421] },
+      "calls": [
+        {
+          "preferred_before": 0,
+          "attempts": [
+            { "endpoint": 0, "result": { "kind": "status", "status": 421 }, "latency_ms": 5, "next": { "kind": "now" } },
+            { "endpoint": 1, "result": { "kind": "status", "status": 421 }, "latency_ms": 5, "next": { "kind": "after", "pause_ms": 100 } },
+            { "endpoint": 0, "result": { "kind": "status", "status": 421 }, "latency_ms": 5, "next": { "kind": "now" } },
+            { "endpoint": 1, "result": { "kind": "status", "status": 421 }, "latency_ms": 5, "next": { "kind": "after", "pause_ms": 200 } },
+            { "endpoint": 0, "result": { "kind": "status", "status": 421 }, "latency_ms": 5, "next": { "kind": "now" } },
+            { "endpoint": 1, "result": { "kind": "status", "status": 421 }, "latency_ms": 5 }
+          ],
+          "rotations": [
+            { "left": 0, "reason": { "kind": "status", "status": 421 } },
+            { "left": 1, "reason": { "kind": "status", "status": 421 } },
+            { "left": 0, "reason": { "kind": "status", "status": 421 } },
+            { "left": 1, "reason": { "kind": "status", "status": 421 } },
+            { "left": 0, "reason": { "kind": "status", "status": 421 } }
+          ],
+          "outcome": {
+            "kind": "endpoints_exhausted",
+            "attempts": [
+              { "endpoint": 0, "outcome": { "kind": "status", "status": 421 }, "rotated": true },
+              { "endpoint": 1, "outcome": { "kind": "status", "status": 421 }, "rotated": true },
+              { "endpoint": 0, "outcome": { "kind": "status", "status": 421 }, "rotated": true },
+              { "endpoint": 1, "outcome": { "kind": "status", "status": 421 }, "rotated": true },
+              { "endpoint": 0, "outcome": { "kind": "status", "status": 421 }, "rotated": true },
+              { "endpoint": 1, "outcome": { "kind": "status", "status": 421 }, "rotated": false }
+            ],
+            "last": { "kind": "api", "status": 421 },
+            "proves_not_processed": true
+          },
+          "preferred_after": 0
+        }
+      ]
+    },
+    {
+      "name": "sticky_endpoint_survives_across_calls",
+      "about": "The endpoint that answered is where the next call starts, and a rotation from it wraps around the set.",
+      "endpoints": 2,
+      "policy": { "max_attempts": 4, "base_delay_ms": 100, "max_delay_ms": 1600, "jitter": "none", "deadline_ms": 5000 },
+      "request": { "method": "GET", "retry_on_status": [421] },
+      "calls": [
+        {
+          "preferred_before": 0,
+          "attempts": [
+            { "endpoint": 0, "result": { "kind": "status", "status": 421 }, "next": { "kind": "now" } },
+            { "endpoint": 1, "result": { "kind": "status", "status": 200 } }
+          ],
+          "rotations": [{ "left": 0, "reason": { "kind": "status", "status": 421 } }],
+          "outcome": { "kind": "ok", "status": 200 },
+          "preferred_after": 1
+        },
+        {
+          "preferred_before": 1,
+          "attempts": [
+            { "endpoint": 1, "result": { "kind": "status", "status": 200 } }
+          ],
+          "rotations": [],
+          "outcome": { "kind": "ok", "status": 200 },
+          "preferred_after": 1
+        },
+        {
+          "preferred_before": 1,
+          "attempts": [
+            { "endpoint": 1, "result": { "kind": "status", "status": 421 }, "next": { "kind": "now" } },
+            { "endpoint": 0, "result": { "kind": "status", "status": 200 } }
+          ],
+          "rotations": [{ "left": 1, "reason": { "kind": "status", "status": 421 } }],
+          "outcome": { "kind": "ok", "status": 200 },
+          "preferred_after": 0
+        }
+      ]
+    },
+    {
+      "name": "single_endpoint_matches_retry_v1",
+      "about": "One endpoint behaves exactly as 0.2.0 (retry-v1 authorize backoff: base 100, max 1600, no jitter): a listed 421 retries in place with pauses 100, 200, 400 until max_attempts, and the last 421 comes back as it is.",
+      "endpoints": 1,
+      "policy": { "max_attempts": 4, "base_delay_ms": 100, "max_delay_ms": 1600, "jitter": "none", "deadline_ms": null },
+      "request": { "method": "POST", "retriable": true, "retry_on_status": [421, 503] },
+      "calls": [
+        {
+          "preferred_before": 0,
+          "attempts": [
+            { "endpoint": 0, "result": { "kind": "status", "status": 421 }, "next": { "kind": "after", "pause_ms": 100 } },
+            { "endpoint": 0, "result": { "kind": "status", "status": 421 }, "next": { "kind": "after", "pause_ms": 200 } },
+            { "endpoint": 0, "result": { "kind": "status", "status": 421 }, "next": { "kind": "after", "pause_ms": 400 } },
+            { "endpoint": 0, "result": { "kind": "status", "status": 421 } }
+          ],
+          "rotations": [],
+          "outcome": { "kind": "api", "status": 421 },
+          "preferred_after": 0
+        }
+      ]
+    },
+    {
+      "name": "single_endpoint_connect_failures_retry_in_place",
+      "about": "One refused endpoint retries in place on the 0.2.0 schedule and returns the transport error.",
+      "endpoints": 1,
+      "policy": { "max_attempts": 3, "base_delay_ms": 50, "max_delay_ms": 1600, "jitter": "none", "deadline_ms": null },
+      "request": { "method": "GET", "retry_on_status": [] },
+      "calls": [
+        {
+          "preferred_before": 0,
+          "attempts": [
+            { "endpoint": 0, "result": { "kind": "connect" }, "next": { "kind": "after", "pause_ms": 50 } },
+            { "endpoint": 0, "result": { "kind": "connect" }, "next": { "kind": "after", "pause_ms": 100 } },
+            { "endpoint": 0, "result": { "kind": "connect" } }
+          ],
+          "rotations": [],
+          "outcome": { "kind": "transport", "reason": { "kind": "connect" } },
+          "preferred_after": 0
+        }
+      ]
+    },
+    {
+      "name": "non_retriable_post_never_reaches_a_second_endpoint",
+      "about": "A POST not marked retriable fails on the first endpoint exactly as 0.2.0, even with 421 listed.",
+      "endpoints": 2,
+      "policy": { "max_attempts": 4, "base_delay_ms": 100, "max_delay_ms": 1600, "jitter": "none", "deadline_ms": 5000 },
+      "request": { "method": "POST", "retriable": false, "retry_on_status": [421] },
+      "calls": [
+        {
+          "preferred_before": 0,
+          "attempts": [
+            { "endpoint": 0, "result": { "kind": "status", "status": 421 } }
+          ],
+          "rotations": [],
+          "outcome": { "kind": "api", "status": 421 },
+          "preferred_after": 0
+        }
+      ]
+    },
+    {
+      "name": "default_retriable_status_retries_the_same_endpoint",
+      "about": "A 502 not listed in retry_on_status is retried on the same endpoint with backoff, and the answer moves the preference there.",
+      "endpoints": 2,
+      "policy": { "max_attempts": 4, "base_delay_ms": 50, "max_delay_ms": 1600, "jitter": "none", "deadline_ms": 5000 },
+      "request": { "method": "GET", "retry_on_status": [421] },
+      "calls": [
+        {
+          "preferred_before": 0,
+          "attempts": [
+            { "endpoint": 0, "result": { "kind": "status", "status": 502 }, "next": { "kind": "after", "pause_ms": 50 } },
+            { "endpoint": 0, "result": { "kind": "status", "status": 200 } }
+          ],
+          "rotations": [],
+          "outcome": { "kind": "ok", "status": 200 },
+          "preferred_after": 0
+        }
+      ]
+    },
+    {
+      "name": "attempt_timeout_rotates",
+      "about": "An attempt that times out rotates at once.",
+      "endpoints": 2,
+      "attempt_timeout_ms": 100,
+      "policy": { "max_attempts": 4, "base_delay_ms": 100, "max_delay_ms": 1600, "jitter": "none", "deadline_ms": 5000 },
+      "request": { "method": "GET", "retry_on_status": [421] },
+      "calls": [
+        {
+          "preferred_before": 0,
+          "attempts": [
+            { "endpoint": 0, "result": { "kind": "stall" }, "next": { "kind": "now" } },
+            { "endpoint": 1, "result": { "kind": "status", "status": 200 } }
+          ],
+          "rotations": [{ "left": 0, "reason": { "kind": "timeout" } }],
+          "outcome": { "kind": "ok", "status": 200 },
+          "preferred_after": 1
+        }
+      ]
+    },
+    {
+      "name": "definitive_refusal_after_a_rotation_is_returned_and_sticks",
+      "about": "A 404 from the next endpoint ends the call as it is (not a trace) and moves the preference there.",
+      "endpoints": 2,
+      "policy": { "max_attempts": 4, "base_delay_ms": 100, "max_delay_ms": 1600, "jitter": "none", "deadline_ms": 5000 },
+      "request": { "method": "GET", "retry_on_status": [421] },
+      "calls": [
+        {
+          "preferred_before": 0,
+          "attempts": [
+            { "endpoint": 0, "result": { "kind": "status", "status": 421 }, "next": { "kind": "now" } },
+            { "endpoint": 1, "result": { "kind": "status", "status": 404 } }
+          ],
+          "rotations": [{ "left": 0, "reason": { "kind": "status", "status": 421 } }],
+          "outcome": { "kind": "api", "status": 404 },
+          "preferred_after": 1
+        }
+      ]
+    },
+    {
+      "name": "cycle_where_every_endpoint_sent_retry_after_waits_the_smallest",
+      "about": "Both endpoints answer a listed 503 with Retry-After; the cycle pause is the smaller one.",
+      "endpoints": 2,
+      "policy": { "max_attempts": 3, "base_delay_ms": 100, "max_delay_ms": 1600, "jitter": "none", "deadline_ms": 10000 },
+      "request": { "method": "GET", "retry_on_status": [503] },
+      "calls": [
+        {
+          "preferred_before": 0,
+          "attempts": [
+            { "endpoint": 0, "result": { "kind": "status", "status": 503, "retry_after_s": 2 }, "next": { "kind": "now" } },
+            { "endpoint": 1, "result": { "kind": "status", "status": 503, "retry_after_s": 1 }, "next": { "kind": "after", "pause_ms": 1000 } },
+            { "endpoint": 0, "result": { "kind": "status", "status": 200 } }
+          ],
+          "rotations": [
+            { "left": 0, "reason": { "kind": "status", "status": 503 } },
+            { "left": 1, "reason": { "kind": "status", "status": 503 } }
+          ],
+          "outcome": { "kind": "ok", "status": 200 },
+          "preferred_after": 0
+        }
+      ]
+    },
+    {
+      "name": "max_attempts_exhausts_after_rotations",
+      "about": "max_attempts counts every send across the set; the trace proves nothing was processed (421, connect, 421).",
+      "endpoints": 3,
+      "policy": { "max_attempts": 3, "base_delay_ms": 100, "max_delay_ms": 1600, "jitter": "none", "deadline_ms": null },
+      "request": { "method": "GET", "retry_on_status": [421] },
+      "calls": [
+        {
+          "preferred_before": 0,
+          "attempts": [
+            { "endpoint": 0, "result": { "kind": "status", "status": 421 }, "next": { "kind": "now" } },
+            { "endpoint": 1, "result": { "kind": "connect" }, "next": { "kind": "now" } },
+            { "endpoint": 2, "result": { "kind": "status", "status": 421 } }
+          ],
+          "rotations": [
+            { "left": 0, "reason": { "kind": "status", "status": 421 } },
+            { "left": 1, "reason": { "kind": "connect" } }
+          ],
+          "outcome": {
+            "kind": "endpoints_exhausted",
+            "attempts": [
+              { "endpoint": 0, "outcome": { "kind": "status", "status": 421 }, "rotated": true },
+              { "endpoint": 1, "outcome": { "kind": "connect" }, "rotated": true },
+              { "endpoint": 2, "outcome": { "kind": "status", "status": 421 }, "rotated": false }
+            ],
+            "last": { "kind": "api", "status": 421 },
+            "proves_not_processed": true
+          },
+          "preferred_after": 0
+        }
+      ]
+    },
+    {
+      "name": "exhaustion_after_a_timeout_may_have_been_processed",
+      "about": "A timeout in the trace means an attempt may have been applied.",
+      "endpoints": 2,
+      "attempt_timeout_ms": 100,
+      "policy": { "max_attempts": 2, "base_delay_ms": 100, "max_delay_ms": 1600, "jitter": "none", "deadline_ms": null },
+      "request": { "method": "GET", "retry_on_status": [421] },
+      "calls": [
+        {
+          "preferred_before": 0,
+          "attempts": [
+            { "endpoint": 0, "result": { "kind": "stall" }, "next": { "kind": "now" } },
+            { "endpoint": 1, "result": { "kind": "status", "status": 421 } }
+          ],
+          "rotations": [{ "left": 0, "reason": { "kind": "timeout" } }],
+          "outcome": {
+            "kind": "endpoints_exhausted",
+            "attempts": [
+              { "endpoint": 0, "outcome": { "kind": "timeout" }, "rotated": true },
+              { "endpoint": 1, "outcome": { "kind": "status", "status": 421 }, "rotated": false }
+            ],
+            "last": { "kind": "api", "status": 421 },
+            "proves_not_processed": false
+          },
+          "preferred_after": 0
+        }
+      ]
+    },
+    {
+      "name": "expired_deadline_sends_nothing",
+      "about": "A deadline already spent before the first attempt: deadline_exceeded with attempts 0, no trace, no request.",
+      "endpoints": 2,
+      "policy": { "max_attempts": 4, "base_delay_ms": 100, "max_delay_ms": 1600, "jitter": "none", "deadline_ms": 0 },
+      "request": { "method": "GET", "retry_on_status": [421] },
+      "calls": [
+        {
+          "preferred_before": 0,
+          "attempts": [],
+          "rotations": [],
+          "outcome": { "kind": "deadline_exceeded", "attempts": 0 },
+          "preferred_after": 0
+        }
+      ]
+    },
+    {
+      "name": "accepted_rotation_status_is_returned_as_a_success_on_exhaustion",
+      "about": "A status both listed and accepted rotates while budget remains, then comes back as a success, as 0.2.0 returned it.",
+      "endpoints": 2,
+      "policy": { "max_attempts": 2, "base_delay_ms": 100, "max_delay_ms": 1600, "jitter": "none", "deadline_ms": null },
+      "request": { "method": "GET", "retry_on_status": [421], "accept_status": [421] },
+      "calls": [
+        {
+          "preferred_before": 0,
+          "attempts": [
+            { "endpoint": 0, "result": { "kind": "status", "status": 421 }, "next": { "kind": "now" } },
+            { "endpoint": 1, "result": { "kind": "status", "status": 421 } }
+          ],
+          "rotations": [{ "left": 0, "reason": { "kind": "status", "status": 421 } }],
+          "outcome": { "kind": "ok", "status": 421 },
+          "preferred_after": 0
+        }
+      ]
+    },
+    {
+      "name": "full_jitter_cycle_pauses_use_the_draws",
+      "about": "Cycle pauses draw like any computed pause: k=1 is floored at base (100), k=2 spreads [100, 200] with draw 0.5 to 150.",
+      "endpoints": 2,
+      "policy": { "max_attempts": 5, "base_delay_ms": 100, "max_delay_ms": 1600, "jitter": "full", "deadline_ms": null },
+      "request": { "method": "GET", "retry_on_status": [421] },
+      "calls": [
+        {
+          "preferred_before": 0,
+          "draws": [0.25, 0.5],
+          "attempts": [
+            { "endpoint": 0, "result": { "kind": "status", "status": 421 }, "next": { "kind": "now" } },
+            { "endpoint": 1, "result": { "kind": "status", "status": 421 }, "next": { "kind": "after", "pause_ms": 100 } },
+            { "endpoint": 0, "result": { "kind": "status", "status": 421 }, "next": { "kind": "now" } },
+            { "endpoint": 1, "result": { "kind": "status", "status": 421 }, "next": { "kind": "after", "pause_ms": 150 } },
+            { "endpoint": 0, "result": { "kind": "status", "status": 200 } }
+          ],
+          "rotations": [
+            { "left": 0, "reason": { "kind": "status", "status": 421 } },
+            { "left": 1, "reason": { "kind": "status", "status": 421 } },
+            { "left": 0, "reason": { "kind": "status", "status": 421 } },
+            { "left": 1, "reason": { "kind": "status", "status": 421 } }
+          ],
+          "outcome": { "kind": "ok", "status": 200 },
+          "preferred_after": 0
+        }
+      ]
+    }
+  ]
+}

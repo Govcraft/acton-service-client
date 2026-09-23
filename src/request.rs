@@ -7,10 +7,11 @@ use reqwest::{Method, StatusCode};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
-use crate::client::ServiceClient;
+use crate::client::{ServiceClient, redirect_verdict};
 use crate::context::RequestContext;
 use crate::error::{ClientError, build_api_error, parse_retry_after, snippet};
-use crate::retry::{attempt_timeout, is_idempotent, remaining_until, wants_retry};
+use crate::failover::{Failover, Next, Outcome, Stop};
+use crate::retry::{attempt_timeout, is_idempotent, remaining_until};
 use crate::url::{build_url, join_segments};
 
 /// A fluent builder for a single request.
@@ -139,6 +140,10 @@ impl RequestBuilder {
     /// `423` with `Retry-After`; see [`ApiError::is_retriable`](crate::ApiError::is_retriable)).
     /// Repeatable: call it once per extra status.
     ///
+    /// On a client with an [endpoint set](crate::ServiceClientBuilder::failover_endpoint),
+    /// a listed status is a **rotation status**: the next attempt goes to the
+    /// next endpoint at once, instead of pausing and retrying the same one.
+    ///
     /// **Only takes effect when retries apply to this request**: a
     /// [`RetryPolicy`](crate::RetryPolicy) is configured on the client *and* the
     /// method is idempotent or the request is marked
@@ -221,11 +226,16 @@ impl RequestBuilder {
     /// logical operation can share one budget: compute the instant once and
     /// pass it to each, and each request gets only what the earlier ones left.
     ///
+    /// One deadline covers every attempt on every endpoint of the client's
+    /// [endpoint set](crate::ServiceClientBuilder::failover_endpoint).
+    ///
     /// A request whose deadline has already passed is not sent: it fails at
-    /// once with a non-retriable [`ClientError::DeadlineExceeded`]. Once a
-    /// request has been sent, running out of budget returns the last attempt's
-    /// error or response instead (an attempt cut short by the deadline is a
-    /// [`ClientError::Transport`] timeout).
+    /// once with a non-retriable [`ClientError::DeadlineExceeded`] whose
+    /// `attempts` is `0`. Once a request has been sent, running out of budget
+    /// returns the last attempt's error or response instead (an attempt cut
+    /// short by the deadline is a [`ClientError::Transport`] timeout), or
+    /// [`ClientError::EndpointsExhausted`] once the call has failed over
+    /// between endpoints.
     ///
     /// # Examples
     ///
@@ -369,11 +379,13 @@ impl RequestBuilder {
         headers
     }
 
-    /// Execute the request, applying the retry policy and any deadline, and
-    /// return the raw response for any status treated as success.
+    /// Execute the request, applying the retry policy, any deadline, and
+    /// failover across the client's endpoint set, and return the raw response
+    /// for any status treated as success.
     ///
     /// When retries are exhausted (by `max_attempts` or the deadline), the last
-    /// error or response is returned exactly as a single attempt would return it.
+    /// error or response is returned exactly as a single attempt would return
+    /// it, unless the call had failed over between endpoints.
     ///
     /// # Errors
     ///
@@ -382,43 +394,64 @@ impl RequestBuilder {
     /// failures. An attempt cut short by the deadline is a
     /// [`ClientError::Transport`] timeout. A request whose deadline passed
     /// before its first attempt is not sent and fails with
-    /// [`ClientError::DeadlineExceeded`].
+    /// [`ClientError::DeadlineExceeded`] (`attempts == 0`). A call over an
+    /// endpoint set that runs out of budget after failing over at least once
+    /// fails with [`ClientError::EndpointsExhausted`], carrying the trace.
     pub async fn send(self) -> Result<reqwest::Response, ClientError> {
         self.execute(fastrand::f64).await
     }
 
     /// The send loop, with the jitter randomness injected so tests can pin it.
+    ///
+    /// Every decision comes from the pure [`Failover`] state machine; this
+    /// loop only sends, reads, and sleeps.
     async fn execute(
         self,
         mut draw: impl FnMut() -> f64,
     ) -> Result<reqwest::Response, ClientError> {
         let started = Instant::now();
-        let url = url::Url::parse(&self.url_string())
+        let inner = &self.client.inner;
+        let base = url::Url::parse(&self.url_string())
             .map_err(|e| ClientError::Config(format!("invalid request URL: {e}")))?;
+        let urls = inner
+            .origins
+            .iter()
+            .enumerate()
+            .map(|(index, origin)| {
+                if index == 0 {
+                    Ok(base.clone())
+                } else {
+                    origin.apply_to(&base)
+                }
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         let headers = self.effective_headers();
         let deadline = self.deadline(started);
+        let policy = if self.retry_allowed() {
+            inner.retry.as_ref()
+        } else {
+            None
+        };
+        let multi = inner.origins.len() > 1;
 
-        let mut attempt: u32 = 1;
+        let mut failover = Failover::new(inner.origins.len(), inner.preferred());
         // The outcome of the previous attempt, returned instead of a new one
-        // if the pause before this attempt used up the rest of the budget.
+        // if the budget runs out before the next.
         let mut last: Option<Result<reqwest::Response, ClientError>> = None;
         loop {
             let remaining = remaining_until(deadline, Instant::now());
-            if remaining == Some(Duration::ZERO) {
-                // Nothing sent yet (no `last`): the budget was spent before
-                // the first attempt.
-                return last.unwrap_or_else(|| {
-                    Err(ClientError::DeadlineExceeded {
-                        attempts: attempt - 1,
-                        elapsed: started.elapsed(),
-                    })
-                });
+            let attempt = match failover.begin(remaining) {
+                Ok(attempt) => attempt,
+                Err(stop) => return self.finish(stop, &failover, last, started),
+            };
+            if let (Some((left, reason)), Some(observer)) = (attempt.rotated_from, &inner.observer)
+            {
+                observer.on_rotation(&inner.origins[left], reason);
             }
-            let mut rb = self
-                .client
-                .inner
+            let slot = &inner.slots[attempt.endpoint];
+            let mut rb = slot
                 .http
-                .request(self.method.clone(), url.clone());
+                .request(self.method.clone(), urls[attempt.endpoint].clone());
             if !self.query.is_empty() {
                 rb = rb.query(&self.query);
             }
@@ -426,59 +459,79 @@ impl RequestBuilder {
             if let Some(body) = &self.body {
                 rb = rb.body(body.clone());
             }
-            if let Some(timeout) = attempt_timeout(
-                self.timeout,
-                self.client.inner.attempt_timeout,
-                self.client.inner.timeout,
-                remaining,
-            ) {
+            if let Some(timeout) =
+                attempt_timeout(self.timeout, inner.attempt_timeout, slot.timeout, remaining)
+            {
                 rb = rb.timeout(timeout);
             }
 
-            let (outcome, pause) = match rb.send().await {
-                Ok(resp) if resp.status().is_success() => return Ok(resp),
+            let (result, outcome) = match rb.send().await {
                 Ok(resp) => {
+                    if multi && let Err(refusal) = redirect_verdict(&inner.origins, resp.url()) {
+                        return Err(ClientError::Config(format!(
+                            "the supplied HTTP client {refusal}; build it with \
+                             reqwest::redirect::Policy::none() so failover stays in the set"
+                        )));
+                    }
                     let status = resp.status();
+                    if status.is_success() {
+                        inner.prefer(attempt.endpoint);
+                        return Ok(resp);
+                    }
                     let retry_after = parse_retry_after(resp.headers());
                     let accepted = self.accept_extra.contains(&status);
-                    let retry = wants_retry(status, retry_after, accepted, &self.retry_on);
+                    let outcome = Outcome::of_status(status, retry_after, accepted, &self.retry_on);
+                    if !outcome.is_rotation() {
+                        inner.prefer(attempt.endpoint);
+                    }
                     if accepted {
                         // Kept unread, so that on exhaustion it is returned intact.
-                        let pause = self.pause_before_retry(
-                            retry,
-                            attempt,
-                            &mut draw,
-                            retry_after,
-                            deadline,
-                        );
-                        (Ok(resp), pause)
+                        (Ok(resp), outcome)
                     } else {
                         let resp_headers = resp.headers().clone();
                         let text = resp.text().await.unwrap_or_default();
                         let api = build_api_error(status, &resp_headers, &text);
-                        let pause = self.pause_before_retry(
-                            retry,
-                            attempt,
-                            &mut draw,
-                            retry_after,
-                            deadline,
-                        );
-                        (Err(ClientError::Api(Box::new(api))), pause)
+                        (Err(ClientError::Api(Box::new(api))), outcome)
                     }
                 }
                 Err(e) => {
-                    let transient = e.is_timeout() || e.is_connect();
-                    let pause =
-                        self.pause_before_retry(transient, attempt, &mut draw, None, deadline);
-                    (Err(ClientError::Transport(e)), pause)
+                    let outcome = Outcome::of_transport(e.is_connect(), e.is_timeout());
+                    (Err(ClientError::Transport(e)), outcome)
                 }
             };
-            let Some(pause) = pause else {
-                return outcome;
-            };
-            last = Some(outcome);
-            tokio::time::sleep(pause).await;
-            attempt += 1;
+            let remaining = remaining_until(deadline, Instant::now());
+            match failover.after(outcome, policy, &mut draw, remaining) {
+                Ok(next) => {
+                    last = Some(result);
+                    if let Next::After(pause) = next {
+                        tokio::time::sleep(pause).await;
+                    }
+                }
+                Err(stop) => return self.finish(stop, &failover, Some(result), started),
+            }
+        }
+    }
+
+    /// The result of a call that stopped without a success.
+    fn finish(
+        &self,
+        stop: Stop,
+        failover: &Failover,
+        last: Option<Result<reqwest::Response, ClientError>>,
+        started: Instant,
+    ) -> Result<reqwest::Response, ClientError> {
+        match (stop, last) {
+            (Stop::Raw, Some(result)) | (Stop::Exhausted, Some(result @ Ok(_))) => result,
+            (Stop::Exhausted, Some(Err(error))) => Err(ClientError::EndpointsExhausted(Box::new(
+                failover.trace(&self.client.inner.origins, error, started.elapsed()),
+            ))),
+            (Stop::NothingSent | Stop::Raw | Stop::Exhausted, None) => {
+                Err(ClientError::DeadlineExceeded {
+                    attempts: failover.attempts(),
+                    elapsed: started.elapsed(),
+                })
+            }
+            (Stop::NothingSent, Some(result)) => result,
         }
     }
 
@@ -489,25 +542,6 @@ impl RequestBuilder {
             let budget = self.client.inner.retry.as_ref()?.deadline?;
             started.checked_add(budget)
         })
-    }
-
-    /// The pause before another attempt, or `None` to stop and return the
-    /// current outcome. `None` unless the outcome is `retriable`, retries apply
-    /// to this request, attempts remain, and the pause ends before the deadline.
-    fn pause_before_retry(
-        &self,
-        retriable: bool,
-        attempt: u32,
-        draw: &mut impl FnMut() -> f64,
-        retry_after: Option<Duration>,
-        deadline: Option<Instant>,
-    ) -> Option<Duration> {
-        if !(retriable && self.retry_allowed()) {
-            return None;
-        }
-        let policy = self.client.inner.retry.as_ref()?;
-        let remaining = remaining_until(deadline, Instant::now());
-        policy.next_pause(attempt, draw(), retry_after, remaining)
     }
 
     /// Send the request and decode a JSON success body into `T`.
