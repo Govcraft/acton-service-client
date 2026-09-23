@@ -38,7 +38,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   seam, with no metrics dependency. `on_rotation(left, reason)` is called for
   each move to the next endpoint, `on_retry(endpoint, reason, attempt)` for
   each re-send to the same endpoint (a single-endpoint client's included).
-  Both default to doing nothing.
+  Both default to doing nothing. Guaranteed: they run synchronously on the
+  caller's task and report every attempt but the last exactly once, in order,
+  with its outcome, so the reports plus the call's result are the complete
+  per-attempt record of a call.
 - `ClientError::InvalidEndpoints(EndpointSetError)`: a duplicate origin after
   normalization, mixed schemes, or a failover endpoint that is not a bare
   origin is a typed build error, never a panic.

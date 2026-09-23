@@ -14,7 +14,8 @@
       "Before each send, if the deadline has passed: deadline_exceeded with attempts 0 when nothing was sent; otherwise the budget is spent.",
       "Budget spent (max_attempts, deadline, or refused pause): if at least one rotation was made (an attempt was actually sent to the next endpoint), endpoints_exhausted with the trace, unless the last outcome was an accepted status, which is returned as a success; otherwise the last outcome as it is.",
       "Sticky preference: any response whose status is not a rotation status for the request moves it to that endpoint; transport failures and rotation statuses never do. The next call starts there.",
-      "The retry observer fires when a re-send is actually sent: a rotation when it goes to the next endpoint (with the endpoint left and the reason), a retry when it goes to the same endpoint (with that endpoint, the reason, and the attempt number). A single endpoint never rotates: every rotation outcome retries in place, exactly as 0.2.0, and is observed as a retry."
+      "The retry observer fires when a re-send is actually sent: a rotation when it goes to the next endpoint (with the endpoint left and the reason), a retry when it goes to the same endpoint (with that endpoint, the reason, and the attempt number). A single endpoint never rotates: every rotation outcome retries in place, exactly as 0.2.0, and is observed as a retry.",
+      "Completeness: 'observed' has exactly one entry for every attempt but the last, in send order, with that attempt's endpoint ('left' for a rotation, 'endpoint' for a retry) and outcome as its reason; a retry's attempt number is the index of the attempt it re-sends plus two. The last attempt is never observed: its outcome is the call's outcome. Observer calls run synchronously on the caller's task."
     ]
   },
   "reasons": [

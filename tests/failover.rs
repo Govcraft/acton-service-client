@@ -337,6 +337,38 @@ async fn fixture_scenarios_over_real_http() {
     }
 }
 
+/// The fixture keeps the observer's completeness guarantee: every attempt but
+/// the last is reported exactly once, in order, with its own endpoint and
+/// outcome. The runners check the implementation against these lists, so
+/// together they pin the guarantee.
+#[test]
+fn fixture_observed_reports_every_attempt_but_the_last() {
+    for scenario in fixture::load().scenarios {
+        for (n, call) in scenario.calls.iter().enumerate() {
+            let ctx = format!("{} call {n}", scenario.name);
+            let sent = &call.attempts;
+            assert_eq!(call.observed.len(), sent.len().saturating_sub(1), "{ctx}");
+            for (i, (seen, attempt)) in call.observed.iter().zip(sent).enumerate() {
+                let reason = attempt.result.reason().expect("a reported attempt");
+                let next = sent[i + 1].endpoint;
+                let expected = if next == attempt.endpoint {
+                    fixture::Observed::Retry {
+                        endpoint: attempt.endpoint,
+                        reason,
+                        attempt: u32::try_from(i + 2).unwrap(),
+                    }
+                } else {
+                    fixture::Observed::Rotation {
+                        left: attempt.endpoint,
+                        reason,
+                    }
+                };
+                assert_eq!(*seen, expected, "{ctx}: attempt {}", i + 1);
+            }
+        }
+    }
+}
+
 #[test]
 fn fixture_reasons_table() {
     for row in fixture::load().reasons {

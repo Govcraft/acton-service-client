@@ -254,8 +254,10 @@ match client
   by default but not listed (`429`, `502`, `503`, `504`) retry the same
   endpoint, and every other answer is returned, as before. A transport failure
   after the request was written (a reset mid-body) is not a connect failure:
-  it is returned as `ClientError::Transport` and never retried, since the
-  endpoint may have processed it.
+  it is returned as `ClientError::Transport` and never retried, exactly as in
+  0.2.0, since the endpoint may have processed it and a patch release must not
+  change what a single-endpoint caller sees. Treat it as ambiguous and re-send
+  with the same idempotency identity.
 - **Sticky.** The next call starts at the endpoint that last gave a definitive
   answer (any status that is not a rotation status, a `4xx` included).
 - **Stays in the set.** A built client follows redirects only within the set;
@@ -271,6 +273,9 @@ match client
   `acton_service::observability::get_meter()` as
   `acton_service_client.endpoint.rotations{reason}` and
   `acton_service_client.endpoint.retries{reason}`, with `reason.label()`.
+  The observer runs on the caller's task and reports every attempt but the
+  last, in order, with its outcome; the call's result is the last. That is the
+  complete per-attempt record of a call, on the success path too.
 - **Parity.** `spec/fixtures/endpoint-failover-v1.json` pins the rules for
   every port; the Rust crate runs it on a virtual clock and over real HTTP.
 

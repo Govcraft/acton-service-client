@@ -194,6 +194,19 @@ pub enum LastError {
     Transport { reason: Reason },
 }
 
+impl ScriptedResult {
+    /// The outcome an observer reports for an attempt that ended this way,
+    /// or `None` for a reset, which always ends the call.
+    pub fn reason(self) -> Option<Reason> {
+        match self {
+            Self::Status { status, .. } => Some(Reason::Status { status }),
+            Self::Connect => Some(Reason::Connect),
+            Self::Stall => Some(Reason::Timeout),
+            Self::Reset => None,
+        }
+    }
+}
+
 impl Policy {
     /// The policy as the crate's type.
     pub fn to_policy(&self) -> acton_service_client::RetryPolicy {

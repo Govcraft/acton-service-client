@@ -276,6 +276,17 @@ impl fmt::Display for EndpointOrigin {
 ///
 /// [`proves_not_processed`](Self::proves_not_processed) encodes this table.
 ///
+/// # A failure after the request was written has no reason
+///
+/// A connection reset (or any other I/O error) after the request was written
+/// is neither [`Connect`](Self::Connect) nor [`Timeout`](Self::Timeout), and
+/// it is deliberately not retried or rotated: the call returns it at once as
+/// [`ClientError::Transport`], exactly as 0.2.0 did. The endpoint may have
+/// processed the request, and a patch release must not change what an
+/// existing single-endpoint caller sees. Treat that error as ambiguous: re-send
+/// the operation with the same idempotency identity, as a caller that owns
+/// the operation's semantics (for example the Axorum SDK) already does.
+///
 /// # Examples
 ///
 /// ```
@@ -369,6 +380,28 @@ impl fmt::Display for RetryReason {
 /// rotation, a re-send to the same endpoint is a retry. A client with a single
 /// endpoint therefore only ever calls [`on_retry`](Self::on_retry). Both run
 /// inside the send loop, so keep them cheap and non-blocking.
+///
+/// # Guarantees
+///
+/// These hold for every call, on a single endpoint or a set, whatever it
+/// returns, and `spec/fixtures/endpoint-failover-v1.json` pins them:
+///
+/// - **One call per attempt but the last, in send order.** Every attempt the
+///   call sends except the last is reported exactly once, by
+///   [`on_rotation`](Self::on_rotation) or [`on_retry`](Self::on_retry), with
+///   that attempt's endpoint and outcome. The last attempt is never reported:
+///   its outcome is what the call returns (the response, or the error).
+/// - **Synchronous, on the caller's task.** Both run inside the future that
+///   `send` returns, on the task that awaits it; the crate spawns no task for
+///   them. A `tokio::task_local!` scoped around the call therefore sees every
+///   report for that call and no other.
+///
+/// So the complete per-attempt record of a call is its reports followed by
+/// its result, on the success path too. For example, a call that meets a
+/// `421`, then a connect failure, then returns an accepted `421` response
+/// reports two reasons (`421`, `connect`) and returns the third outcome; since
+/// all three [prove it](RetryReason::proves_not_processed), no endpoint
+/// processed the request.
 ///
 /// # Recommended wiring for an `acton-service` application
 ///
@@ -1593,7 +1626,7 @@ mod tests {
                         fixture::ScriptedResult::Connect => {
                             clock += ms(scripted.latency_ms);
                             (
-                                Sim::Transport(fixture::Reason::Connect),
+                                Sim::Transport(scripted.result.reason().unwrap()),
                                 Outcome::of_transport(true, false),
                             )
                         }
@@ -1605,7 +1638,7 @@ mod tests {
                             clock += attempt_timeout(None, own, None, left(clock))
                                 .unwrap_or_else(|| panic!("{ctx}: a stall needs a bound"));
                             (
-                                Sim::Transport(fixture::Reason::Timeout),
+                                Sim::Transport(scripted.result.reason().unwrap()),
                                 Outcome::of_transport(false, true),
                             )
                         }
