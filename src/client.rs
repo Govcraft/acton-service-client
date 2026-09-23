@@ -285,6 +285,57 @@ pub struct ServiceClientBuilder {
     http_client: Option<reqwest::Client>,
     failovers: Vec<Endpoint>,
     observer: Option<Arc<dyn RetryObserver>>,
+    tls: TlsSettings,
+}
+
+/// TLS material for a client the builder constructs, held as PEM until
+/// [`ServiceClientBuilder::build`] parses it.
+#[derive(Default)]
+struct TlsSettings {
+    /// Extra trust anchors, one PEM bundle per call.
+    roots: Vec<Vec<u8>>,
+    /// The client certificate chain followed by its private key, as one PEM.
+    identity: Option<Vec<u8>>,
+}
+
+impl TlsSettings {
+    /// Whether any TLS material was configured.
+    fn is_set(&self) -> bool {
+        !self.roots.is_empty() || self.identity.is_some()
+    }
+
+    /// Applies the material to a reqwest builder. Pure apart from parsing.
+    ///
+    /// Errors name what failed to parse, never the bytes: an identity PEM
+    /// carries a private key.
+    fn apply(
+        &self,
+        mut builder: reqwest::ClientBuilder,
+    ) -> Result<reqwest::ClientBuilder, ClientError> {
+        for bundle in &self.roots {
+            let certificates = reqwest::Certificate::from_pem_bundle(bundle).map_err(|e| {
+                ClientError::Config(format!("root certificate PEM could not be used: {e}"))
+            })?;
+            if certificates.is_empty() {
+                return Err(ClientError::Config(
+                    "root certificate PEM holds no certificate".to_string(),
+                ));
+            }
+            for certificate in certificates {
+                builder = builder.add_root_certificate(certificate);
+            }
+        }
+        if let Some(pem) = &self.identity {
+            let identity = reqwest::Identity::from_pem(pem).map_err(|e| {
+                ClientError::Config(format!(
+                    "client identity PEM could not be used (expected a certificate chain and \
+                     its private key): {e}"
+                ))
+            })?;
+            builder = builder.identity(identity);
+        }
+        Ok(builder)
+    }
 }
 
 impl ServiceClientBuilder {
@@ -301,7 +352,82 @@ impl ServiceClientBuilder {
             http_client: None,
             failovers: Vec::new(),
             observer: None,
+            tls: TlsSettings::default(),
         }
+    }
+
+    /// Trust the certificates in a PEM bundle, in addition to the built-in
+    /// roots, for a client the builder constructs.
+    ///
+    /// This is the trust-only path: a deployment whose server certificate is
+    /// issued by a private CA, reached without a client certificate. Call it
+    /// once per bundle; every certificate in each is added. The builder's
+    /// [`timeout`](Self::timeout) applies to the client it builds, so a
+    /// TLS-configured client is bounded exactly as a plain one is.
+    ///
+    /// The PEM is parsed by [`build`](Self::build), which fails with
+    /// [`ClientError::Config`] if it holds no usable certificate, and also if
+    /// a client was supplied with [`with_http_client`](Self::with_http_client),
+    /// whose TLS this builder cannot change.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use acton_service_client::ServiceClient;
+    /// use std::time::Duration;
+    ///
+    /// let ca = std::fs::read("deployment-ca.pem").expect("the CA bundle");
+    /// let client = ServiceClient::builder("https://ledger.internal:8443")
+    ///     .root_certificate_pem(ca)
+    ///     .timeout(Duration::from_secs(10))
+    ///     .build()
+    ///     .expect("a usable CA bundle");
+    /// # let _ = client;
+    /// ```
+    #[must_use]
+    pub fn root_certificate_pem(mut self, pem: impl Into<Vec<u8>>) -> Self {
+        self.tls.roots.push(pem.into());
+        self
+    }
+
+    /// Present a client certificate, for a client the builder constructs:
+    /// mutual TLS against a listener that verifies client certificates.
+    ///
+    /// `cert_pem` is the certificate chain, leaf first, and `key_pem` its
+    /// private key (PKCS#8, PKCS#1 or SEC1). A second call replaces the first.
+    /// Combine it with [`root_certificate_pem`](Self::root_certificate_pem)
+    /// when the server's certificate is issued by a private CA. The builder's
+    /// [`timeout`](Self::timeout) applies to the client it builds.
+    ///
+    /// The PEM is parsed by [`build`](Self::build), which fails with
+    /// [`ClientError::Config`] if the pair cannot be used (the error names what
+    /// failed, never the key), and also if a client was supplied with
+    /// [`with_http_client`](Self::with_http_client).
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use acton_service_client::ServiceClient;
+    ///
+    /// let cert = std::fs::read("operator.pem").expect("the certificate");
+    /// let key = std::fs::read("operator.key").expect("the private key");
+    /// let ca = std::fs::read("deployment-ca.pem").expect("the CA bundle");
+    /// let client = ServiceClient::builder("https://ledger.internal:8443")
+    ///     .identity_pem(cert, key)
+    ///     .root_certificate_pem(ca)
+    ///     .build()
+    ///     .expect("a usable identity");
+    /// # let _ = client;
+    /// ```
+    #[must_use]
+    pub fn identity_pem(mut self, cert_pem: impl Into<Vec<u8>>, key_pem: impl AsRef<[u8]>) -> Self {
+        let mut pem = cert_pem.into();
+        if !pem.ends_with(b"\n") {
+            pem.push(b'\n');
+        }
+        pem.extend_from_slice(key_pem.as_ref());
+        self.tls.identity = Some(pem);
+        self
     }
 
     /// Set the API version for versioned routes (default [`ApiVersion::V1`]).
@@ -420,12 +546,13 @@ impl ServiceClientBuilder {
     /// builder construct one.
     ///
     /// This is the escape hatch for any reqwest capability the builder does not
-    /// surface: a client certificate for mutual TLS (`use_rustls_tls()` +
-    /// [`Identity`](reqwest::Identity)), a custom root store, a proxy, a shared
-    /// connection pool, or a custom DNS resolver. In particular it is how you
-    /// pair this crate with an `acton-service` listener that verifies client
-    /// certificates — build a reqwest client carrying the client identity and
-    /// hand it in here.
+    /// surface: a proxy, a shared connection pool, a custom DNS resolver, or a
+    /// root store that replaces the built-in roots rather than adding to them.
+    /// A client certificate for mutual TLS and extra trust anchors do not need
+    /// it: [`identity_pem`](Self::identity_pem) and
+    /// [`root_certificate_pem`](Self::root_certificate_pem) configure them on
+    /// the client the builder constructs, where [`timeout`](Self::timeout)
+    /// still applies.
     ///
     /// The [`bearer_token`](Self::bearer_token) and
     /// [`default_header`](Self::default_header) values still apply: they are sent
@@ -599,9 +726,12 @@ impl ServiceClientBuilder {
     ///
     /// Returns [`ClientError::Config`] if the base URL is not a valid absolute
     /// `http`/`https` URL, or if the bearer token cannot be encoded as a header
-    /// value, or if the underlying HTTP client cannot be constructed. A client
+    /// value, or if the underlying HTTP client cannot be constructed, which
+    /// includes TLS material from [`root_certificate_pem`](Self::root_certificate_pem)
+    /// or [`identity_pem`](Self::identity_pem) that cannot be used. A client
     /// supplied via [`with_http_client`](Self::with_http_client) is used as-is,
-    /// so the last case cannot arise on that path.
+    /// so that case cannot arise on that path; configuring TLS material
+    /// alongside a supplied client is itself a [`ClientError::Config`].
     ///
     /// Returns [`ClientError::InvalidEndpoints`] if a
     /// [`failover_endpoint`](Self::failover_endpoint) is not a bare origin,
@@ -642,13 +772,24 @@ impl ServiceClientBuilder {
         let failover_urls: Vec<&str> = self.failovers.iter().map(Endpoint::url).collect();
         let origins = validate_set(primary, &failover_urls)?;
 
+        if self.http_client.is_some() && self.tls.is_set() {
+            return Err(ClientError::Config(
+                "root_certificate_pem and identity_pem configure a client this builder \
+                 constructs, and a client was supplied with with_http_client; configure TLS \
+                 on the supplied client, or drop it"
+                    .to_string(),
+            ));
+        }
+
         let shared = match self.http_client {
             Some(client) => Slot {
                 http: client,
                 timeout: None,
             },
             None => {
-                let mut builder = reqwest::Client::builder().timeout(self.timeout);
+                let mut builder = self
+                    .tls
+                    .apply(reqwest::Client::builder().timeout(self.timeout))?;
                 if origins.len() > 1 {
                     builder = builder.redirect(in_set_redirects(origins.clone()));
                 }

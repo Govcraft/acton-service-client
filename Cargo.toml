@@ -23,5 +23,8 @@ uuid = { version = "1.23.4", features = ["v4"] }
 [dev-dependencies]
 axum = "0.8.9"
 opentelemetry = "0.33.0"
+rcgen = "0.14.10"
+rustls = "0.23.45"
 tokio = { version = "1.52.3", features = ["full"] }
+tokio-rustls = "0.26.5"
 tracing = "0.1.44"
