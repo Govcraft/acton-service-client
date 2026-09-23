@@ -12,11 +12,12 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use acton_service_client::{
-    ClientError, Endpoint, EndpointOrigin, EndpointSetError, Method, RetryPolicy, RotationReason,
-    ServiceClient, StatusCode, reqwest,
+    ClientError, Endpoint, EndpointOrigin, EndpointSetError, Method, RetryObserver, RetryPolicy,
+    RetryReason, ServiceClient, StatusCode, reqwest,
 };
 use axum::http::{HeaderMap, HeaderValue, StatusCode as AxumStatus};
 use axum::response::{IntoResponse, Redirect};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 type Log = Arc<Mutex<Vec<usize>>>;
 
@@ -61,6 +62,83 @@ async fn scripted_endpoint(
         }
     });
     serve(app).await
+}
+
+/// Where a resetting endpoint breaks each connection.
+#[derive(Clone, Copy, Debug)]
+enum Break {
+    /// Once the request head has arrived, while any body may still be on its
+    /// way.
+    AfterRequestHead,
+    /// After answering with a `200` head and part of its body.
+    MidResponseBody,
+}
+
+/// Accept every connection, read the request head, log the arrival as
+/// `index`, then reset the connection (RST) at `at`. The request has been
+/// written by then, so the client must never see a connect failure.
+async fn resetting_endpoint(index: usize, at: Break, log: Log) -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            let log = log.clone();
+            tokio::spawn(async move {
+                let mut head = Vec::new();
+                let mut buf = [0_u8; 4096];
+                while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match stream.read(&mut buf).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => head.extend_from_slice(&buf[..n]),
+                    }
+                }
+                log.lock().unwrap().push(index);
+                if let Break::MidResponseBody = at {
+                    let partial = b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+                                    content-length: 1000\r\n\r\n{\"partial\":";
+                    if stream.write_all(partial).await.is_err() {
+                        return;
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                stream.set_zero_linger().unwrap();
+            });
+        }
+    });
+    format!("http://{addr}")
+}
+
+/// One call to the [`RetryObserver`], as recorded.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Seen {
+    Rotation(EndpointOrigin, RetryReason),
+    Retry(EndpointOrigin, RetryReason, u32),
+}
+
+/// Records every observer call, in order.
+#[derive(Clone, Default)]
+struct Recorder(Arc<Mutex<Vec<Seen>>>);
+
+impl RetryObserver for Recorder {
+    fn on_rotation(&self, left: &EndpointOrigin, reason: RetryReason) {
+        self.0
+            .lock()
+            .unwrap()
+            .push(Seen::Rotation(left.clone(), reason));
+    }
+
+    fn on_retry(&self, endpoint: &EndpointOrigin, reason: RetryReason, attempt: u32) {
+        self.0
+            .lock()
+            .unwrap()
+            .push(Seen::Retry(endpoint.clone(), reason, attempt));
+    }
+}
+
+impl Recorder {
+    fn take(&self) -> Vec<Seen> {
+        std::mem::take(&mut *self.0.lock().unwrap())
+    }
 }
 
 async fn serve(app: axum::Router) -> String {
@@ -108,6 +186,9 @@ fn observed(
         Err(ClientError::DeadlineExceeded { attempts, .. }) => {
             fixture::CallOutcome::DeadlineExceeded { attempts }
         }
+        Err(ClientError::Transport(e)) if !e.is_connect() && !e.is_timeout() => {
+            fixture::CallOutcome::Reset
+        }
         Err(ClientError::EndpointsExhausted(trace)) => fixture::CallOutcome::EndpointsExhausted {
             attempts: trace
                 .attempts
@@ -128,8 +209,6 @@ fn observed(
     }
 }
 
-type Rotations = Arc<Mutex<Vec<(EndpointOrigin, RotationReason)>>>;
-
 async fn run_scenario(scenario: &fixture::Scenario) {
     let name = &scenario.name;
     let mut scripts = vec![Vec::new(); scenario.endpoints];
@@ -142,11 +221,20 @@ async fn run_scenario(scenario: &fixture::Scenario) {
     let mut urls = Vec::new();
     let mut dead = Vec::new();
     for (index, script) in scripts.into_iter().enumerate() {
-        let connects = script
-            .iter()
-            .filter(|(r, _)| *r == fixture::ScriptedResult::Connect)
-            .count();
-        urls.push(if connects == 0 {
+        let count =
+            |kind: fixture::ScriptedResult| script.iter().filter(|(r, _)| *r == kind).count();
+        let (connects, resets) = (
+            count(fixture::ScriptedResult::Connect),
+            count(fixture::ScriptedResult::Reset),
+        );
+        urls.push(if resets > 0 {
+            assert_eq!(
+                resets,
+                script.len(),
+                "{name}: a resetting endpoint only resets"
+            );
+            resetting_endpoint(index, Break::AfterRequestHead, log.clone()).await
+        } else if connects == 0 {
             scripted_endpoint(index, script, log.clone()).await
         } else {
             assert_eq!(
@@ -161,13 +249,10 @@ async fn run_scenario(scenario: &fixture::Scenario) {
         });
     }
 
-    let rotations: Rotations = Arc::default();
-    let seen = rotations.clone();
+    let recorder = Recorder::default();
     let mut builder = ServiceClient::builder(urls[0].clone())
         .failover_endpoints(urls[1..].iter().cloned())
-        .rotation_observer(move |left: &EndpointOrigin, reason: RotationReason| {
-            seen.lock().unwrap().push((left.clone(), reason));
-        });
+        .retry_observer(recorder.clone());
     if let Some(policy) = &scenario.policy {
         builder = builder.retry(policy.to_policy());
     }
@@ -181,7 +266,7 @@ async fn run_scenario(scenario: &fixture::Scenario) {
         let ctx = format!("{name} call {n}");
         assert_eq!(preferred(&client), call.preferred_before, "{ctx}");
         log.lock().unwrap().clear();
-        rotations.lock().unwrap().clear();
+        recorder.take();
 
         let method = Method::from_bytes(scenario.request.method.as_bytes()).unwrap();
         let mut request = client
@@ -209,16 +294,22 @@ async fn run_scenario(scenario: &fixture::Scenario) {
             reached,
             "{ctx}: requests that reached a server"
         );
-        let rotated: Vec<fixture::Rotation> = rotations
-            .lock()
-            .unwrap()
-            .iter()
-            .map(|(left, reason)| fixture::Rotation {
-                left: index_of(&client, left),
-                reason: fixture::Reason::from_label(reason.label()),
+        let seen: Vec<fixture::Observed> = recorder
+            .take()
+            .into_iter()
+            .map(|seen| match seen {
+                Seen::Rotation(left, reason) => fixture::Observed::Rotation {
+                    left: index_of(&client, &left),
+                    reason: fixture::Reason::from_label(reason.label()),
+                },
+                Seen::Retry(endpoint, reason, attempt) => fixture::Observed::Retry {
+                    endpoint: index_of(&client, &endpoint),
+                    reason: fixture::Reason::from_label(reason.label()),
+                    attempt,
+                },
             })
             .collect();
-        assert_eq!(rotated, call.rotations, "{ctx}");
+        assert_eq!(seen, call.observed, "{ctx}");
         assert_eq!(preferred(&client), call.preferred_after, "{ctx}");
         if call.draws.is_empty() {
             let paused: u64 = call
@@ -476,4 +567,118 @@ async fn per_endpoint_client_carries_that_endpoints_requests() {
     let response = client.request(Method::GET, "x").send().await.unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(*seen.lock().unwrap(), ["backup"]);
+}
+
+/// A reset set up so that it happens mid-body, against `[resetting, healthy]`
+/// with a retriable POST that rotates on 421: the transport error must come
+/// back as it is, never as a connect failure, and nothing is retried.
+async fn reset_is_never_a_connect_failure(at: Break, body: Vec<u8>) {
+    let log: Log = Arc::default();
+    let resetting = resetting_endpoint(0, at, log.clone()).await;
+    let (healthy, healthy_hits) = constant(AxumStatus::OK).await;
+    let recorder = Recorder::default();
+    let client = ServiceClient::builder(resetting)
+        .failover_endpoint(healthy)
+        .retry(RetryPolicy::with_max_attempts(4).deadline(Duration::from_secs(5)))
+        .retry_observer(recorder.clone())
+        .build()
+        .unwrap();
+
+    let err = client
+        .request(Method::POST, "authorize")
+        .retriable(true)
+        .retry_on_status(StatusCode::MISDIRECTED_REQUEST)
+        .body(body, "application/octet-stream")
+        .unwrap()
+        .send_json::<serde_json::Value>()
+        .await
+        .unwrap_err();
+
+    let ClientError::Transport(e) = &err else {
+        panic!("{at:?}: expected a transport error, got {err:?}");
+    };
+    assert!(
+        !e.is_connect(),
+        "{at:?}: a reset reported as a connect failure: {e:?}"
+    );
+    assert!(!e.is_timeout(), "{at:?}: {e:?}");
+    assert!(!err.is_retriable(), "{at:?}");
+    assert!(err.failover_trace().is_none(), "{at:?}");
+    assert_eq!(
+        *log.lock().unwrap(),
+        vec![0],
+        "{at:?}: one attempt reached it"
+    );
+    assert_eq!(
+        *healthy_hits.lock().unwrap(),
+        0,
+        "{at:?}: rotated after a reset"
+    );
+    assert_eq!(
+        recorder.take(),
+        Vec::new(),
+        "{at:?}: the observer heard a re-send"
+    );
+    assert_eq!(preferred(&client), 0, "{at:?}");
+}
+
+#[tokio::test]
+async fn reset_mid_request_body_is_never_a_connect_failure() {
+    // A body far larger than the socket buffers, so the reset lands while the
+    // client is still writing it.
+    reset_is_never_a_connect_failure(Break::AfterRequestHead, vec![b'x'; 8 << 20]).await;
+}
+
+#[tokio::test]
+async fn reset_mid_response_body_is_never_a_connect_failure() {
+    reset_is_never_a_connect_failure(Break::MidResponseBody, Vec::new()).await;
+}
+
+#[tokio::test]
+async fn single_endpoint_client_reports_every_resend_as_a_retry() {
+    let status = |status| fixture::ScriptedResult::Status {
+        status,
+        retry_after_s: None,
+    };
+    let log: Log = Arc::default();
+    let only = scripted_endpoint(
+        0,
+        vec![(status(503), 1), (status(421), 1), (status(200), 1)],
+        log.clone(),
+    )
+    .await;
+    let recorder = Recorder::default();
+    let client = ServiceClient::builder(only)
+        .retry(RetryPolicy::with_max_attempts(4).base_delay(Duration::from_millis(10)))
+        .retry_observer(recorder.clone())
+        .build()
+        .unwrap();
+
+    let response = client
+        .request(Method::POST, "authorize")
+        .retriable(true)
+        .retry_on_status(StatusCode::MISDIRECTED_REQUEST)
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(*log.lock().unwrap(), vec![0, 0, 0]);
+    let origin = client.endpoints()[0].clone();
+    assert_eq!(
+        recorder.take(),
+        vec![
+            Seen::Retry(
+                origin.clone(),
+                RetryReason::Status(StatusCode::SERVICE_UNAVAILABLE),
+                2
+            ),
+            Seen::Retry(
+                origin,
+                RetryReason::Status(StatusCode::MISDIRECTED_REQUEST),
+                3
+            ),
+        ],
+        "a single endpoint re-sends in place: retries only, never a rotation"
+    );
 }

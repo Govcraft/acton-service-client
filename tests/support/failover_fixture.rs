@@ -101,7 +101,7 @@ pub struct Call {
     #[serde(default)]
     pub draws: Vec<f64>,
     pub attempts: Vec<ScriptedAttempt>,
-    pub rotations: Vec<Rotation>,
+    pub observed: Vec<Observed>,
     pub outcome: CallOutcome,
     pub preferred_after: usize,
 }
@@ -130,6 +130,7 @@ pub enum ScriptedResult {
     },
     Connect,
     Stall,
+    Reset,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
@@ -139,10 +140,19 @@ pub enum NextStep {
     After { pause_ms: u64 },
 }
 
+/// One call to the retry observer, in order.
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
-pub struct Rotation {
-    pub left: usize,
-    pub reason: Reason,
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Observed {
+    Rotation {
+        left: usize,
+        reason: Reason,
+    },
+    Retry {
+        endpoint: usize,
+        reason: Reason,
+        attempt: u32,
+    },
 }
 
 #[derive(Debug, Deserialize, PartialEq, Eq)]
@@ -157,6 +167,9 @@ pub enum CallOutcome {
     Transport {
         reason: Reason,
     },
+    /// A transport failure after the request was written: neither a connect
+    /// failure nor a timeout, returned as it is.
+    Reset,
     DeadlineExceeded {
         attempts: u32,
     },
@@ -202,7 +215,7 @@ impl Policy {
 
 impl Reason {
     /// The fixture form of a crate reason, from its
-    /// [`label`](acton_service_client::RotationReason::label).
+    /// [`label`](acton_service_client::RetryReason::label).
     pub fn from_label(label: &str) -> Self {
         match label {
             "connect" => Self::Connect,
@@ -214,13 +227,13 @@ impl Reason {
     }
 
     /// The reason as the crate's type.
-    pub fn to_reason(self) -> acton_service_client::RotationReason {
+    pub fn to_reason(self) -> acton_service_client::RetryReason {
         match self {
-            Self::Status { status } => acton_service_client::RotationReason::Status(
+            Self::Status { status } => acton_service_client::RetryReason::Status(
                 acton_service_client::StatusCode::from_u16(status).expect("a valid status"),
             ),
-            Self::Connect => acton_service_client::RotationReason::Connect,
-            Self::Timeout => acton_service_client::RotationReason::Timeout,
+            Self::Connect => acton_service_client::RetryReason::Connect,
+            Self::Timeout => acton_service_client::RetryReason::Timeout,
         }
     }
 }

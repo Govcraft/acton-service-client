@@ -10,7 +10,7 @@ use serde::de::DeserializeOwned;
 use crate::client::{ServiceClient, redirect_verdict};
 use crate::context::RequestContext;
 use crate::error::{ClientError, build_api_error, parse_retry_after, snippet};
-use crate::failover::{Failover, Next, Outcome, Stop};
+use crate::failover::{Failover, Next, Outcome, Resend, Stop};
 use crate::retry::{attempt_timeout, is_idempotent, remaining_until};
 use crate::url::{build_url, join_segments};
 
@@ -444,9 +444,15 @@ impl RequestBuilder {
                 Ok(attempt) => attempt,
                 Err(stop) => return self.finish(stop, &failover, last, started),
             };
-            if let (Some((left, reason)), Some(observer)) = (attempt.rotated_from, &inner.observer)
-            {
-                observer.on_rotation(&inner.origins[left], reason);
+            if let (Some(resend), Some(observer)) = (attempt.resend, &inner.observer) {
+                match resend {
+                    Resend::Rotation { from, reason } => {
+                        observer.on_rotation(&inner.origins[from], reason);
+                    }
+                    Resend::Retry { reason } => {
+                        observer.on_retry(&inner.origins[attempt.endpoint], reason, attempt.number);
+                    }
+                }
             }
             let slot = &inner.slots[attempt.endpoint];
             let mut rb = slot

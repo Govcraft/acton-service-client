@@ -28,11 +28,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   definitive answer (any status that is not a rotation status, a `4xx`
   included); transport failures and rotation statuses never move it.
 - `EndpointOrigin`: a normalized `scheme://host:port` origin.
-- `RotationReason` (`Status`, `Connect`, `Timeout`) with `label()` for metrics
+- `RetryReason` (`Status`, `Connect`, `Timeout`) with `label()` for metrics
   and `proves_not_processed()` (true only for `Connect` and `Status(421)`).
-- `RotationObserver` and `ServiceClientBuilder::rotation_observer`: called on
-  every rotation with the endpoint left and the reason. It is the metrics seam;
-  the crate takes no metrics dependency.
+  `Connect` is reqwest's `is_connect()`: the connection could not be
+  established, so no byte of the request was written. A transport failure
+  after the request was written (a reset mid-body) is never `Connect`; as in
+  0.2.0 it is not retried and comes back as `ClientError::Transport`.
+- `RetryObserver` and `ServiceClientBuilder::retry_observer`: the metrics
+  seam, with no metrics dependency. `on_rotation(left, reason)` is called for
+  each move to the next endpoint, `on_retry(endpoint, reason, attempt)` for
+  each re-send to the same endpoint (a single-endpoint client's included).
+  Both default to doing nothing.
 - `ClientError::InvalidEndpoints(EndpointSetError)`: a duplicate origin after
   normalization, mixed schemes, or a failover endpoint that is not a bare
   origin is a typed build error, never a panic.

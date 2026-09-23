@@ -10,7 +10,7 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 
 use crate::error::ClientError;
-use crate::failover::{Endpoint, EndpointOrigin, RotationObserver, validate_set};
+use crate::failover::{Endpoint, EndpointOrigin, RetryObserver, validate_set};
 use crate::health::{HealthResponse, ReadinessResponse};
 use crate::request::RequestBuilder;
 use crate::retry::RetryPolicy;
@@ -37,7 +37,7 @@ pub(crate) struct Inner {
     /// The endpoint the next call starts at (see
     /// [`ServiceClient::preferred_endpoint`]).
     pub(crate) preferred: AtomicUsize,
-    pub(crate) observer: Option<Arc<dyn RotationObserver>>,
+    pub(crate) observer: Option<Arc<dyn RetryObserver>>,
     pub(crate) base_url: String,
     pub(crate) base_path: String,
     pub(crate) version: ApiVersion,
@@ -284,7 +284,7 @@ pub struct ServiceClientBuilder {
     default_headers: HeaderMap,
     http_client: Option<reqwest::Client>,
     failovers: Vec<Endpoint>,
-    observer: Option<Arc<dyn RotationObserver>>,
+    observer: Option<Arc<dyn RetryObserver>>,
 }
 
 impl ServiceClientBuilder {
@@ -558,25 +558,37 @@ impl ServiceClientBuilder {
         self
     }
 
-    /// Be notified of every endpoint rotation; see [`RotationObserver`] for
-    /// when it is called and how to count rotations as a metric.
+    /// Be notified of every re-send: each rotation to the next endpoint and
+    /// each retry on the same one, on a single-endpoint client too. See
+    /// [`RetryObserver`] for when each is called and how to count them as
+    /// metrics.
     ///
     /// # Examples
     ///
     /// ```
-    /// use acton_service_client::{EndpointOrigin, RotationReason, ServiceClient};
+    /// use acton_service_client::{EndpointOrigin, RetryObserver, RetryReason, ServiceClient};
+    ///
+    /// struct Log;
+    ///
+    /// impl RetryObserver for Log {
+    ///     fn on_rotation(&self, left: &EndpointOrigin, reason: RetryReason) {
+    ///         eprintln!("left {left}: {reason}");
+    ///     }
+    ///
+    ///     fn on_retry(&self, endpoint: &EndpointOrigin, reason: RetryReason, attempt: u32) {
+    ///         eprintln!("attempt {attempt} to {endpoint} after {reason}");
+    ///     }
+    /// }
     ///
     /// let client = ServiceClient::builder("https://a.example.com")
     ///     .failover_endpoint("https://b.example.com")
-    ///     .rotation_observer(|left: &EndpointOrigin, reason: RotationReason| {
-    ///         eprintln!("left {left}: {reason}");
-    ///     })
+    ///     .retry_observer(Log)
     ///     .build()
     ///     .expect("a valid endpoint set");
     /// # let _ = client;
     /// ```
     #[must_use]
-    pub fn rotation_observer(mut self, observer: impl RotationObserver) -> Self {
+    pub fn retry_observer(mut self, observer: impl RetryObserver) -> Self {
         self.observer = Some(Arc::new(observer));
         self
     }

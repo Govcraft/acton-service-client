@@ -14,13 +14,18 @@
 //! - a status listed with
 //!   [`retry_on_status`](crate::RequestBuilder::retry_on_status), such as
 //!   `421 Misdirected Request`;
-//! - a connect failure;
+//! - a connect failure (reqwest's `is_connect()`: the connection could not be
+//!   established, so no byte of the request was written);
 //! - an attempt timeout.
 //!
 //! Every other outcome behaves exactly as with a single endpoint: a status
 //! that is retriable by default (`429`, `502`, `503`, `504`, and `423` with
 //! `Retry-After`) is retried on the **same** endpoint with the policy's
-//! backoff, and anything else is returned at once.
+//! backoff, and anything else is returned at once. That includes a transport
+//! failure after the request was written (a connection reset mid-body, for
+//! example): it is neither a connect failure nor a timeout, so it is returned
+//! as [`ClientError::Transport`] and never retried, since the endpoint may
+//! have processed the request.
 //!
 //! After a full cycle of rotations (every endpoint in the set answered with a
 //! rotation outcome in a row) the client pauses before starting the next
@@ -28,6 +33,8 @@
 //! smallest server `Retry-After` when every rotation in the cycle carried one.
 //! One deadline covers every attempt on every endpoint, and `max_attempts`
 //! counts every send. The client never sends to an origin outside the set.
+//! A [`RetryObserver`] hears of every re-send: each rotation, and each retry
+//! on the same endpoint.
 //!
 //! Every decision (set validation, the classification of an attempt's
 //! outcome, and whether to stop, retry the same endpoint, or rotate) is a pure
@@ -251,8 +258,8 @@ impl fmt::Display for EndpointOrigin {
     }
 }
 
-/// Why an attempt asked for another try, and so why the client left an
-/// endpoint.
+/// Why an attempt asked for another try: on the next endpoint (a rotation) or
+/// on the same one (a retry). A [`RetryObserver`] receives it for each.
 ///
 /// It is also the outcome recorded for every attempt in a [`FailoverTrace`],
 /// since an attempt that ends a failover call early (a success, or an answer
@@ -262,7 +269,7 @@ impl fmt::Display for EndpointOrigin {
 ///
 /// | Reason | Did the endpoint process the request? |
 /// |--------|---------------------------------------|
-/// | [`Connect`](Self::Connect) | **No.** The connection failed before the request was sent. |
+/// | [`Connect`](Self::Connect) | **No.** The connection could not be established, so no byte of the request was written. |
 /// | [`Status(421)`](Self::Status) | **No.** The endpoint refused it as misdirected. |
 /// | [`Timeout`](Self::Timeout) | Unknown: it may have been processed. |
 /// | any other [`Status`](Self::Status) | Unknown: it may have been processed. |
@@ -272,36 +279,40 @@ impl fmt::Display for EndpointOrigin {
 /// # Examples
 ///
 /// ```
-/// use acton_service_client::{RotationReason, StatusCode};
+/// use acton_service_client::{RetryReason, StatusCode};
 ///
-/// let reason = RotationReason::Status(StatusCode::MISDIRECTED_REQUEST);
+/// let reason = RetryReason::Status(StatusCode::MISDIRECTED_REQUEST);
 /// assert_eq!(reason.label(), "421");
 /// assert!(reason.proves_not_processed());
-/// assert!(!RotationReason::Timeout.proves_not_processed());
+/// assert!(!RetryReason::Timeout.proves_not_processed());
 /// ```
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum RotationReason {
+pub enum RetryReason {
     /// The endpoint answered with this status.
     Status(StatusCode),
-    /// The connection to the endpoint could not be established.
+    /// The connection to the endpoint could not be established (reqwest's
+    /// `is_connect()`, a connect timeout included), so no byte of the request
+    /// was written. A failure after the request was written is never
+    /// `Connect`: it is not retried at all, and is returned as
+    /// [`ClientError::Transport`].
     Connect,
     /// The attempt ran out of time before an answer arrived.
     Timeout,
 }
 
-impl RotationReason {
+impl RetryReason {
     /// A short, stable label for metrics: the status code (`"421"`),
     /// `"connect"` or `"timeout"`.
     ///
     /// # Examples
     ///
     /// ```
-    /// use acton_service_client::{RotationReason, StatusCode};
+    /// use acton_service_client::{RetryReason, StatusCode};
     ///
-    /// assert_eq!(RotationReason::Status(StatusCode::SERVICE_UNAVAILABLE).label(), "503");
-    /// assert_eq!(RotationReason::Connect.label(), "connect");
-    /// assert_eq!(RotationReason::Timeout.label(), "timeout");
+    /// assert_eq!(RetryReason::Status(StatusCode::SERVICE_UNAVAILABLE).label(), "503");
+    /// assert_eq!(RetryReason::Connect.label(), "connect");
+    /// assert_eq!(RetryReason::Timeout.label(), "timeout");
     /// ```
     #[must_use]
     pub fn label(&self) -> &str {
@@ -319,12 +330,12 @@ impl RotationReason {
     /// # Examples
     ///
     /// ```
-    /// use acton_service_client::{RotationReason, StatusCode};
+    /// use acton_service_client::{RetryReason, StatusCode};
     ///
-    /// assert!(RotationReason::Connect.proves_not_processed());
-    /// assert!(RotationReason::Status(StatusCode::MISDIRECTED_REQUEST).proves_not_processed());
-    /// assert!(!RotationReason::Status(StatusCode::SERVICE_UNAVAILABLE).proves_not_processed());
-    /// assert!(!RotationReason::Timeout.proves_not_processed());
+    /// assert!(RetryReason::Connect.proves_not_processed());
+    /// assert!(RetryReason::Status(StatusCode::MISDIRECTED_REQUEST).proves_not_processed());
+    /// assert!(!RetryReason::Status(StatusCode::SERVICE_UNAVAILABLE).proves_not_processed());
+    /// assert!(!RetryReason::Timeout.proves_not_processed());
     /// ```
     #[must_use]
     pub fn proves_not_processed(&self) -> bool {
@@ -335,7 +346,7 @@ impl RotationReason {
     }
 }
 
-impl fmt::Display for RotationReason {
+impl fmt::Display for RetryReason {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Status(status) => write!(f, "status {}", status.as_u16()),
@@ -345,34 +356,57 @@ impl fmt::Display for RotationReason {
     }
 }
 
-/// Notified each time a call leaves one endpoint for the next.
+/// Notified of every re-send a call makes: each rotation to the next
+/// endpoint, and each retry on the same endpoint.
 ///
 /// This is the crate's metrics seam: it carries no metrics dependency, so the
-/// application wires it to whatever it exports. Any
-/// `Fn(&EndpointOrigin, RotationReason) + Send + Sync + 'static` closure is an
-/// observer.
+/// application wires it to whatever it exports. Both methods default to doing
+/// nothing, so implement only the ones you need.
 ///
-/// It is called once per rotation actually made, just before the next attempt
-/// is sent to the next endpoint, with the endpoint being left and the reason.
-/// A client with a single endpoint never calls it. It runs inside the send
-/// loop, so keep it cheap and non-blocking.
+/// Each method is called once per re-send actually made, just before that
+/// attempt is sent (a re-send the deadline or `max_attempts` stops is never
+/// reported). The two never overlap: a re-send to another endpoint is a
+/// rotation, a re-send to the same endpoint is a retry. A client with a single
+/// endpoint therefore only ever calls [`on_retry`](Self::on_retry). Both run
+/// inside the send loop, so keep them cheap and non-blocking.
 ///
 /// # Recommended wiring for an `acton-service` application
 ///
-/// Count rotations on the service's own meter provider, labelled by reason:
+/// Count both on the service's own meter provider, labelled by reason, as two
+/// counters: `acton_service_client.endpoint.rotations` (the call changed
+/// endpoint) and `acton_service_client.endpoint.retries` (it re-sent to the
+/// same one). A single-endpoint deployment answering `421` shows up in the
+/// second.
 ///
 /// ```ignore
 /// use acton_service::observability::get_meter;
+/// use acton_service_client::{EndpointOrigin, RetryObserver, RetryReason};
 /// use opentelemetry::KeyValue;
+/// use opentelemetry::metrics::Counter;
 ///
-/// let rotations = get_meter()
-///     .u64_counter("acton_service_client.endpoint.rotations")
-///     .with_description("Endpoint rotations, by reason")
-///     .build();
+/// struct Metrics {
+///     rotations: Counter<u64>,
+///     retries: Counter<u64>,
+/// }
+///
+/// impl RetryObserver for Metrics {
+///     fn on_rotation(&self, left: &EndpointOrigin, reason: RetryReason) {
+///         tracing::warn!(%left, %reason, "left endpoint");
+///         self.rotations.add(1, &[KeyValue::new("reason", reason.label().to_owned())]);
+///     }
+///
+///     fn on_retry(&self, endpoint: &EndpointOrigin, reason: RetryReason, attempt: u32) {
+///         tracing::warn!(%endpoint, %reason, attempt, "re-sending to the same endpoint");
+///         self.retries.add(1, &[KeyValue::new("reason", reason.label().to_owned())]);
+///     }
+/// }
+///
+/// let meter = get_meter();
 /// let client = ServiceClient::builder("https://a.example.com")
 ///     .failover_endpoint("https://b.example.com")
-///     .rotation_observer(move |_left: &EndpointOrigin, reason: RotationReason| {
-///         rotations.add(1, &[KeyValue::new("reason", reason.label().to_string())]);
+///     .retry_observer(Metrics {
+///         rotations: meter.u64_counter("acton_service_client.endpoint.rotations").build(),
+///         retries: meter.u64_counter("acton_service_client.endpoint.retries").build(),
 ///     })
 ///     .build()?;
 /// ```
@@ -380,32 +414,65 @@ impl fmt::Display for RotationReason {
 /// # Examples
 ///
 /// ```
-/// use acton_service_client::{EndpointOrigin, RotationReason, ServiceClient};
-/// use std::sync::Arc;
+/// use acton_service_client::{EndpointOrigin, RetryObserver, RetryReason, ServiceClient};
 /// use std::sync::atomic::{AtomicU64, Ordering};
 ///
-/// let rotations = Arc::new(AtomicU64::new(0));
-/// let counter = rotations.clone();
+/// #[derive(Default)]
+/// struct Rotations(AtomicU64);
+///
+/// impl RetryObserver for Rotations {
+///     fn on_rotation(&self, _left: &EndpointOrigin, _reason: RetryReason) {
+///         self.0.fetch_add(1, Ordering::Relaxed);
+///     }
+/// }
+///
 /// let client = ServiceClient::builder("https://a.example.com")
 ///     .failover_endpoint("https://b.example.com")
-///     .rotation_observer(move |_left: &EndpointOrigin, _reason: RotationReason| {
-///         counter.fetch_add(1, Ordering::Relaxed);
-///     })
+///     .retry_observer(Rotations::default())
 ///     .build()
 ///     .expect("a valid endpoint set");
 /// # let _ = client;
 /// ```
-pub trait RotationObserver: Send + Sync + 'static {
-    /// The call is leaving endpoint `left` because of `reason`.
-    fn on_rotation(&self, left: &EndpointOrigin, reason: RotationReason);
-}
+pub trait RetryObserver: Send + Sync + 'static {
+    /// The call is leaving endpoint `left` for the next one in the set because
+    /// of `reason`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use acton_service_client::{EndpointOrigin, RetryObserver, RetryReason};
+    ///
+    /// struct Log;
+    ///
+    /// impl RetryObserver for Log {
+    ///     fn on_rotation(&self, left: &EndpointOrigin, reason: RetryReason) {
+    ///         eprintln!("left {left}: {reason}");
+    ///     }
+    /// }
+    /// ```
+    fn on_rotation(&self, left: &EndpointOrigin, reason: RetryReason) {
+        let _ = (left, reason);
+    }
 
-impl<F> RotationObserver for F
-where
-    F: Fn(&EndpointOrigin, RotationReason) + Send + Sync + 'static,
-{
-    fn on_rotation(&self, left: &EndpointOrigin, reason: RotationReason) {
-        self(left, reason);
+    /// The call is re-sending to `endpoint`, the endpoint that just answered
+    /// with `reason`; `attempt` is the number of the attempt about to be sent
+    /// (`2` for the first re-send), counted over the whole call.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use acton_service_client::{EndpointOrigin, RetryObserver, RetryReason};
+    ///
+    /// struct Log;
+    ///
+    /// impl RetryObserver for Log {
+    ///     fn on_retry(&self, endpoint: &EndpointOrigin, reason: RetryReason, attempt: u32) {
+    ///         eprintln!("attempt {attempt} to {endpoint} after {reason}");
+    ///     }
+    /// }
+    /// ```
+    fn on_retry(&self, endpoint: &EndpointOrigin, reason: RetryReason, attempt: u32) {
+        let _ = (endpoint, reason, attempt);
     }
 }
 
@@ -510,7 +577,7 @@ pub struct FailoverTrace {
 
 impl FailoverTrace {
     /// Whether every attempt's outcome proves its endpoint did not process the
-    /// request (see [`RotationReason::proves_not_processed`]). When true,
+    /// request (see [`RetryReason::proves_not_processed`]). When true,
     /// nothing was applied anywhere in the set.
     ///
     /// # Examples
@@ -576,7 +643,7 @@ pub struct TracedAttempt {
     /// The endpoint the attempt was sent to.
     pub endpoint: EndpointOrigin,
     /// How the attempt ended.
-    pub outcome: RotationReason,
+    pub outcome: RetryReason,
     /// Whether the next attempt went to the next endpoint because of this
     /// outcome (`false` for a retry on the same endpoint, and for the final
     /// attempt).
@@ -646,7 +713,7 @@ fn bare_origin(index: usize, raw: &str) -> Result<EndpointOrigin, EndpointSetErr
 pub(crate) enum Outcome {
     /// Another try is wanted, and on a set it goes to the next endpoint.
     Rotate {
-        reason: RotationReason,
+        reason: RetryReason,
         retry_after: Option<Duration>,
     },
     /// Another try is wanted, on the same endpoint (retriable by default).
@@ -671,7 +738,7 @@ impl Outcome {
     ) -> Self {
         if retry_on.contains(&status) {
             Self::Rotate {
-                reason: RotationReason::Status(status),
+                reason: RetryReason::Status(status),
                 retry_after,
             }
         } else if !accepted && status_is_retriable(status, retry_after) {
@@ -689,9 +756,9 @@ impl Outcome {
     /// which are exactly the transport errors 0.2.0 retried.
     pub(crate) fn of_transport(connect: bool, timeout: bool) -> Self {
         let reason = if connect {
-            RotationReason::Connect
+            RetryReason::Connect
         } else if timeout {
-            RotationReason::Timeout
+            RetryReason::Timeout
         } else {
             return Self::Final;
         };
@@ -707,7 +774,7 @@ impl Outcome {
         matches!(self, Self::Rotate { .. })
     }
 
-    fn traced(self) -> Option<(RotationReason, Option<Duration>)> {
+    fn traced(self) -> Option<(RetryReason, Option<Duration>)> {
         match self {
             Self::Rotate {
                 reason,
@@ -716,7 +783,7 @@ impl Outcome {
             Self::Retry {
                 status,
                 retry_after,
-            } => Some((RotationReason::Status(status), retry_after)),
+            } => Some((RetryReason::Status(status), retry_after)),
             Self::Final => None,
         }
     }
@@ -747,15 +814,26 @@ pub(crate) enum Next {
 pub(crate) struct Attempt {
     /// The endpoint to send it to.
     pub(crate) endpoint: usize,
-    /// The endpoint left for this one, and why, when this attempt is a
-    /// rotation (for the [`RotationObserver`]).
-    pub(crate) rotated_from: Option<(usize, RotationReason)>,
+    /// Its number in the call, from `1`.
+    pub(crate) number: u32,
+    /// How it re-sends the previous attempt, if it does (for the
+    /// [`RetryObserver`]).
+    pub(crate) resend: Option<Resend>,
+}
+
+/// A re-send, as the [`RetryObserver`] hears of it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Resend {
+    /// To the next endpoint, leaving `from`.
+    Rotation { from: usize, reason: RetryReason },
+    /// To the same endpoint.
+    Retry { reason: RetryReason },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Entry {
     endpoint: usize,
-    outcome: RotationReason,
+    outcome: RetryReason,
     rotated: bool,
 }
 
@@ -777,9 +855,9 @@ pub(crate) struct Failover {
     /// then the smallest `Retry-After` while every one carried one, and
     /// `Some(None)` once one did not.
     cycle_retry_after: Option<Option<Duration>>,
-    /// A rotation decided but not yet made (made when the next attempt is
+    /// A re-send decided but not yet made (made when the next attempt is
     /// sent).
-    pending: Option<RotationReason>,
+    pending: Option<Resend>,
     trace: Vec<Entry>,
 }
 
@@ -814,15 +892,15 @@ impl Failover {
                 self.spent()
             });
         }
-        let rotated_from = self.pending.take().and_then(|reason| {
-            let left = self.trace.last_mut()?;
+        let resend = self.pending.take();
+        if let (Some(Resend::Rotation { .. }), Some(left)) = (resend, self.trace.last_mut()) {
             left.rotated = true;
-            Some((left.endpoint, reason))
-        });
+        }
         self.attempts = self.attempts.saturating_add(1);
         Ok(Attempt {
             endpoint: self.current,
-            rotated_from,
+            number: self.attempts,
+            resend,
         })
     }
 
@@ -858,15 +936,16 @@ impl Failover {
         } else {
             self.streak = 0;
             self.cycle_retry_after = None;
-            self.pause(policy, retry_after, draw, remaining)
-                .map(Next::After)
+            let pause = self.pause(policy, retry_after, draw, remaining)?;
+            self.pending = Some(Resend::Retry { reason });
+            Ok(Next::After(pause))
         }
     }
 
     fn rotate(
         &mut self,
         policy: &RetryPolicy,
-        reason: RotationReason,
+        reason: RetryReason,
         retry_after: Option<Duration>,
         draw: impl FnOnce() -> f64,
         remaining: Option<Duration>,
@@ -882,7 +961,10 @@ impl Failover {
         } else {
             Next::Now
         };
-        self.pending = Some(reason);
+        self.pending = Some(Resend::Rotation {
+            from: self.current,
+            reason,
+        });
         self.current = (self.current + 1) % self.len;
         Ok(next)
     }
@@ -958,7 +1040,7 @@ mod tests {
     }
 
     const MISDIRECTED: Outcome = Outcome::Rotate {
-        reason: RotationReason::Status(StatusCode::MISDIRECTED_REQUEST),
+        reason: RetryReason::Status(StatusCode::MISDIRECTED_REQUEST),
         retry_after: None,
     };
 
@@ -1069,14 +1151,14 @@ mod tests {
         assert_eq!(
             Outcome::of_transport(true, true),
             Outcome::Rotate {
-                reason: RotationReason::Connect,
+                reason: RetryReason::Connect,
                 retry_after: None
             }
         );
         assert_eq!(
             Outcome::of_transport(false, true),
             Outcome::Rotate {
-                reason: RotationReason::Timeout,
+                reason: RetryReason::Timeout,
                 retry_after: None
             }
         );
@@ -1188,7 +1270,7 @@ mod tests {
     fn a_rotation_is_made_only_when_the_next_attempt_is_sent() {
         let policy = RetryPolicy::with_max_attempts(10);
         let mut failover = Failover::new(2, 0);
-        assert_eq!(failover.begin(None).unwrap().rotated_from, None);
+        assert_eq!(failover.begin(None).unwrap().resend, None);
         failover
             .after(MISDIRECTED, Some(&policy), || 0.0, None)
             .unwrap();
@@ -1204,8 +1286,11 @@ mod tests {
         let second = failover.begin(None).unwrap();
         assert_eq!(second.endpoint, 1);
         assert_eq!(
-            second.rotated_from,
-            Some((0, RotationReason::Status(StatusCode::MISDIRECTED_REQUEST)))
+            second.resend,
+            Some(Resend::Rotation {
+                from: 0,
+                reason: RetryReason::Status(StatusCode::MISDIRECTED_REQUEST)
+            })
         );
         assert_eq!(failover.begin(Some(Duration::ZERO)), Err(Stop::Exhausted));
     }
@@ -1246,7 +1331,7 @@ mod tests {
     fn a_cycle_where_every_rotation_carried_retry_after_waits_the_smallest() {
         let policy = RetryPolicy::with_max_attempts(10).base_delay(ms(5));
         let with = |secs| Outcome::Rotate {
-            reason: RotationReason::Status(StatusCode::SERVICE_UNAVAILABLE),
+            reason: RetryReason::Status(StatusCode::SERVICE_UNAVAILABLE),
             retry_after: Some(Duration::from_secs(secs)),
         };
         let mut failover = Failover::new(2, 0);
@@ -1297,12 +1382,12 @@ mod tests {
             [
                 TracedAttempt {
                     endpoint: origins[0].clone(),
-                    outcome: RotationReason::Connect,
+                    outcome: RetryReason::Connect,
                     rotated: true
                 },
                 TracedAttempt {
                     endpoint: origins[1].clone(),
-                    outcome: RotationReason::Status(StatusCode::MISDIRECTED_REQUEST),
+                    outcome: RetryReason::Status(StatusCode::MISDIRECTED_REQUEST),
                     rotated: false
                 },
             ]
@@ -1311,7 +1396,7 @@ mod tests {
         assert!(trace.to_string().contains("safe to send again"), "{trace}");
     }
 
-    fn fixture_reason(reason: RotationReason) -> fixture::Reason {
+    fn fixture_reason(reason: RetryReason) -> fixture::Reason {
         fixture::Reason::from_label(reason.label())
     }
 
@@ -1381,6 +1466,7 @@ mod tests {
         Accepted(u16),
         Api(u16),
         Transport(fixture::Reason),
+        Reset,
     }
 
     fn sim_outcome(sim: Sim) -> fixture::CallOutcome {
@@ -1388,6 +1474,7 @@ mod tests {
             Sim::Accepted(status) => fixture::CallOutcome::Ok { status },
             Sim::Api(status) => fixture::CallOutcome::Api { status },
             Sim::Transport(reason) => fixture::CallOutcome::Transport { reason },
+            Sim::Reset => fixture::CallOutcome::Reset,
         }
     }
 
@@ -1421,7 +1508,7 @@ mod tests {
                 let left = |clock: Duration| deadline.map(|d| d.saturating_sub(clock));
                 let mut draws = call.draws.iter().copied();
                 let mut script = call.attempts.iter();
-                let mut rotations = Vec::new();
+                let mut observed = Vec::new();
                 let mut failover = Failover::new(scenario.endpoints, preferred);
                 let mut last = None;
                 let finish = |stop: Stop, last: Option<Sim>, failover: &Failover, clock| match (
@@ -1445,7 +1532,7 @@ mod tests {
                         let last = match sim {
                             Sim::Api(status) => fixture::LastError::Api { status },
                             Sim::Transport(reason) => fixture::LastError::Transport { reason },
-                            Sim::Accepted(_) => unreachable!(),
+                            Sim::Accepted(_) | Sim::Reset => unreachable!(),
                         };
                         fixture::CallOutcome::EndpointsExhausted {
                             attempts,
@@ -1462,12 +1549,17 @@ mod tests {
                         Ok(attempt) => attempt,
                         Err(stop) => break finish(stop, last, &failover, clock),
                     };
-                    if let Some((from, reason)) = attempt.rotated_from {
-                        rotations.push(fixture::Rotation {
+                    observed.extend(attempt.resend.map(|resend| match resend {
+                        Resend::Rotation { from, reason } => fixture::Observed::Rotation {
                             left: from,
                             reason: fixture_reason(reason),
-                        });
-                    }
+                        },
+                        Resend::Retry { reason } => fixture::Observed::Retry {
+                            endpoint: attempt.endpoint,
+                            reason: fixture_reason(reason),
+                            attempt: attempt.number,
+                        },
+                    }));
                     let scripted = script
                         .next()
                         .unwrap_or_else(|| panic!("{ctx}: an attempt the fixture does not script"));
@@ -1504,6 +1596,10 @@ mod tests {
                                 Sim::Transport(fixture::Reason::Connect),
                                 Outcome::of_transport(true, false),
                             )
+                        }
+                        fixture::ScriptedResult::Reset => {
+                            clock += ms(scripted.latency_ms);
+                            (Sim::Reset, Outcome::of_transport(false, false))
                         }
                         fixture::ScriptedResult::Stall => {
                             clock += attempt_timeout(None, own, None, left(clock))
@@ -1549,7 +1645,7 @@ mod tests {
                     "{ctx}: scripted attempts left unsent"
                 );
                 assert_eq!(outcome, call.outcome, "{ctx}");
-                assert_eq!(rotations, call.rotations, "{ctx}");
+                assert_eq!(observed, call.observed, "{ctx}");
                 assert_eq!(preferred, call.preferred_after, "{ctx}");
                 assert_eq!(draws.next(), None, "{ctx}: draws left unused");
             }
