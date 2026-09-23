@@ -119,6 +119,10 @@ Every fallible call returns `ClientError`:
 - **`Decode { status, snippet, source }`** — a success body that failed to
   deserialize; keeps a truncated snippet for diagnostics.
 - **`Config(String)`** — builder-time validation (e.g. bad base URL).
+- **`DeadlineExceeded { attempts, elapsed }`** — the call's deadline passed
+  before anything was sent. Not retriable.
+
+`ClientError` is `#[non_exhaustive]`: match it with a wildcard arm.
 
 `ApiError::is_retriable()` is true for `429`, `502`, `503`, `504`, and for `423`
 only when a `Retry-After` was supplied.
@@ -129,7 +133,59 @@ Retries are **off by default**. Configure a `RetryPolicy` to enable exponential
 backoff (with a cap). Retries apply only to idempotent methods
 (`GET`/`HEAD`/`DELETE`/`PUT`) plus any request explicitly marked
 `.retriable(true)`. A server `Retry-After` is honored when present; otherwise
-the delay comes from `RetryPolicy::backoff_delay`, a pure, unit-tested function.
+the pause comes from `RetryPolicy::pause`, a pure, unit-tested function of the
+attempt, a random draw, and the time remaining.
+
+```rust,no_run
+# use acton_service_client::{Jitter, Method, RetryPolicy, ServiceClient, StatusCode};
+# use std::time::Duration;
+# async fn run() -> Result<(), acton_service_client::ClientError> {
+# #[derive(serde::Deserialize)] struct Answer;
+let client = ServiceClient::builder("https://api.example.com")
+    .retry(
+        RetryPolicy::default()
+            .max_attempts(10)
+            .jitter(Jitter::Full)                 // spread pauses over [base, ceiling]
+            .deadline(Duration::from_secs(3)),    // total budget per call
+    )
+    .build()?;
+
+let answer: Answer = client
+    .request(Method::POST, "authorize")
+    .retriable(true)                              // POST: explicit opt-in
+    .retry_on_status(StatusCode::MISDIRECTED_REQUEST)
+    .timeout(Duration::from_millis(500))          // per attempt
+    .send_json()
+    .await?;
+# let _ = answer; Ok(())
+# }
+```
+
+- **Deadline.** `RetryPolicy::deadline` bounds a whole call from its first
+  send. Each attempt's timeout is `min(timeout, remaining)`, and a pause (from
+  backoff or `Retry-After`) that would reach the deadline is not taken: the last
+  error or response is returned. `RequestBuilder::deadline_at(Instant)` sets an
+  absolute deadline instead, so several sends of one operation share one budget.
+  If the budget is already spent before anything is sent, the call fails with
+  `ClientError::DeadlineExceeded` and the server never sees it. Without a
+  deadline, `Retry-After` is honoured uncapped, as in 0.1: set a deadline to
+  bound it.
+- **Jitter.** `Jitter::Full` draws each pause uniformly from `[base_delay,
+  ceiling]`. The floor at `base_delay` is deliberate: unlike textbook full
+  jitter, no pause is ever near zero, so an always-failing upstream is never
+  hammered in a tight loop.
+- **Per-attempt timeout.** The request's `.timeout()` wins, then the client's
+  `ServiceClientBuilder::attempt_timeout`, then the builder's `timeout`. Under a
+  deadline, whichever applies is clamped to the time remaining. With a client
+  supplied via `with_http_client`, a deadline **replaces** that client's own
+  timeout with the remaining budget on every attempt. Set `attempt_timeout` to
+  keep a tighter bound.
+- **Extra statuses.** `RequestBuilder::retry_on_status` extends the retriable
+  set per request. It is checked before `accept_status`, so an accepted status
+  listed for retry is retried first and still returned raw once retries run
+  out. It only applies where retries do (idempotent method or `.retriable(true)`).
+
+Defaults (no deadline, no jitter, no extra statuses) behave exactly as 0.1.
 
 ## Feature table
 
@@ -142,7 +198,7 @@ the delay comes from `RetryPolicy::backoff_delay`, a pure, unit-tested function.
 | Tracking | `RequestContext` for the five propagation headers; auto `x-request-id` (UUID v4) |
 | Rate limits | `RateLimitInfo` surfaced on `ApiError` |
 | Auth | Bearer tokens (JWT or PASETO, opaque to the client) |
-| Retries | Opt-in `RetryPolicy` with pure backoff math |
+| Retries | Opt-in `RetryPolicy`: pure backoff math, floored jitter, total deadline, per-request extra statuses and timeouts |
 
 ## Development
 

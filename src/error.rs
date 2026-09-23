@@ -146,14 +146,21 @@ impl ApiError {
     /// ```
     #[must_use]
     pub fn is_retriable(&self) -> bool {
-        match self.status {
-            StatusCode::TOO_MANY_REQUESTS
-            | StatusCode::BAD_GATEWAY
-            | StatusCode::SERVICE_UNAVAILABLE
-            | StatusCode::GATEWAY_TIMEOUT => true,
-            StatusCode::LOCKED => self.retry_after.is_some(),
-            _ => false,
-        }
+        status_is_retriable(self.status, self.retry_after)
+    }
+}
+
+/// The retriable-by-default rule behind [`ApiError::is_retriable`], as a pure
+/// function of the status and any `Retry-After`, so the retry loop can apply
+/// it before (or without) reading the response body.
+pub(crate) fn status_is_retriable(status: StatusCode, retry_after: Option<Duration>) -> bool {
+    match status {
+        StatusCode::TOO_MANY_REQUESTS
+        | StatusCode::BAD_GATEWAY
+        | StatusCode::SERVICE_UNAVAILABLE
+        | StatusCode::GATEWAY_TIMEOUT => true,
+        StatusCode::LOCKED => retry_after.is_some(),
+        _ => false,
     }
 }
 
@@ -186,6 +193,10 @@ fn status_reason(status: StatusCode) -> &'static str {
 }
 
 /// The top-level error type returned by every fallible client operation.
+///
+/// `#[non_exhaustive]`: match it with a wildcard arm, since new failure modes
+/// may be added in minor releases.
+#[non_exhaustive]
 #[derive(Debug, thiserror::Error)]
 pub enum ClientError {
     /// The server returned a non-success HTTP status.
@@ -212,6 +223,52 @@ pub enum ClientError {
     /// A builder-time configuration error (e.g. an invalid base URL).
     #[error("configuration error: {0}")]
     Config(String),
+
+    /// The call's deadline ([`RetryPolicy::deadline`](crate::RetryPolicy::deadline)
+    /// or [`RequestBuilder::deadline_at`](crate::RequestBuilder::deadline_at))
+    /// had passed before anything was sent.
+    ///
+    /// Returned **only when nothing was sent**, so the server has not seen
+    /// this call, and it is not retriable: the budget is spent. Once an attempt
+    /// has gone out, running out of budget returns that attempt's own outcome
+    /// instead (an attempt cut short by the deadline is a
+    /// [`Transport`](Self::Transport) timeout).
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use acton_service_client::{ClientError, Method, ServiceClient};
+    /// use std::time::Instant;
+    /// # async fn run(client: ServiceClient, deadline: Instant) {
+    /// match client
+    ///     .request(Method::PUT, "reservations/7")
+    ///     .deadline_at(deadline)
+    ///     .send()
+    ///     .await
+    /// {
+    ///     Ok(_) => {}
+    ///     Err(ClientError::DeadlineExceeded { attempts, elapsed }) => {
+    ///         // Nothing reached the server: widen the budget, or re-drive the
+    ///         // operation later under the same idempotency identity.
+    ///         eprintln!("not sent: {attempts} attempts in {elapsed:?}");
+    ///     }
+    ///     Err(other) => eprintln!("failed: {other}"),
+    /// }
+    /// # }
+    /// ```
+    #[error(
+        "deadline exceeded before the request was sent ({attempts} attempts sent, {elapsed:?} \
+         elapsed); widen the deadline, or re-drive the operation with the same idempotency \
+         identity"
+    )]
+    DeadlineExceeded {
+        /// Attempts that reached the network before the deadline was found
+        /// spent. Always `0` today, since the variant is returned only when
+        /// nothing was sent.
+        attempts: u32,
+        /// Time spent inside this call before it gave up.
+        elapsed: Duration,
+    },
 }
 
 impl From<ApiError> for ClientError {
@@ -233,14 +290,14 @@ impl ClientError {
     /// Whether this error is worth retrying.
     ///
     /// Transport errors that are timeouts or connection failures are retriable;
-    /// API errors defer to [`ApiError::is_retriable`]; decode and config errors
-    /// are never retriable.
+    /// API errors defer to [`ApiError::is_retriable`]; decode, config, and
+    /// deadline-exceeded errors are never retriable.
     #[must_use]
     pub fn is_retriable(&self) -> bool {
         match self {
             Self::Api(e) => e.is_retriable(),
             Self::Transport(e) => e.is_timeout() || e.is_connect(),
-            Self::Decode { .. } | Self::Config(_) => false,
+            Self::Decode { .. } | Self::Config(_) | Self::DeadlineExceeded { .. } => false,
         }
     }
 }
@@ -473,5 +530,22 @@ mod tests {
         assert!(s.contains("404"));
         assert!(s.contains("NOT_FOUND"));
         assert!(s.contains("gone"));
+    }
+
+    #[test]
+    fn deadline_exceeded_is_not_retriable_and_says_what_to_do() {
+        let err = ClientError::DeadlineExceeded {
+            attempts: 0,
+            elapsed: Duration::from_millis(3),
+        };
+        assert!(!err.is_retriable());
+        assert!(err.as_api().is_none());
+        let text = err.to_string();
+        assert!(
+            text.contains("deadline exceeded before the request was sent"),
+            "{text}"
+        );
+        assert!(text.contains("widen the deadline"), "{text}");
+        assert!(text.contains("same idempotency identity"), "{text}");
     }
 }

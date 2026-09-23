@@ -1,5 +1,7 @@
 //! Per-request builder and the retry/execute loop.
 
+use std::time::{Duration, Instant};
+
 use reqwest::header::{CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue};
 use reqwest::{Method, StatusCode};
 use serde::Serialize;
@@ -7,8 +9,8 @@ use serde::de::DeserializeOwned;
 
 use crate::client::ServiceClient;
 use crate::context::RequestContext;
-use crate::error::{ClientError, build_api_error, snippet};
-use crate::retry::is_idempotent;
+use crate::error::{ClientError, build_api_error, parse_retry_after, snippet};
+use crate::retry::{attempt_timeout, is_idempotent, remaining_until, wants_retry};
 use crate::url::{build_url, join_segments};
 
 /// A fluent builder for a single request.
@@ -49,6 +51,9 @@ pub struct RequestBuilder {
     body: Option<Vec<u8>>,
     retriable_override: bool,
     accept_extra: Vec<StatusCode>,
+    retry_on: Vec<StatusCode>,
+    timeout: Option<Duration>,
+    deadline_at: Option<Instant>,
 }
 
 impl RequestBuilder {
@@ -69,6 +74,9 @@ impl RequestBuilder {
             body: None,
             retriable_override: false,
             accept_extra: Vec::new(),
+            retry_on: Vec::new(),
+            timeout: None,
+            deadline_at: None,
         }
     }
 
@@ -115,9 +123,134 @@ impl RequestBuilder {
     }
 
     /// Treat an additional status code as a success (returned rather than raised).
+    ///
+    /// A status that is also listed with
+    /// [`retry_on_status`](Self::retry_on_status) is retried first, and only
+    /// returned once retries are exhausted.
     #[must_use]
     pub fn accept_status(mut self, status: StatusCode) -> Self {
         self.accept_extra.push(status);
+        self
+    }
+
+    /// Also retry this request when the server answers `status`.
+    ///
+    /// Extends the statuses retried by default (`429`, `502`, `503`, `504`, and
+    /// `423` with `Retry-After`; see [`ApiError::is_retriable`](crate::ApiError::is_retriable)).
+    /// Repeatable: call it once per extra status.
+    ///
+    /// **Only takes effect when retries apply to this request**: a
+    /// [`RetryPolicy`](crate::RetryPolicy) is configured on the client *and* the
+    /// method is idempotent or the request is marked
+    /// [`retriable(true)`](Self::retriable). A `POST` answered `421` is not
+    /// retried just because `421` is listed here; mark it retriable first.
+    ///
+    /// It is checked **before** [`accept_status`](Self::accept_status): a status
+    /// in both lists is retried while attempts and the deadline allow (honouring
+    /// any `Retry-After`), and once they run out the last response goes down
+    /// the normal path, so an accepted status is still returned raw and
+    /// decodable.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use acton_service_client::{Method, ServiceClient, StatusCode};
+    /// # async fn run(client: ServiceClient) -> Result<(), acton_service_client::ClientError> {
+    /// # #[derive(serde::Deserialize)] struct Answer;
+    /// // A `421 Misdirected Request` means "try another replica": retry it.
+    /// let answer: Answer = client
+    ///     .request(Method::POST, "authorize")
+    ///     .retriable(true)
+    ///     .retry_on_status(StatusCode::MISDIRECTED_REQUEST)
+    ///     .send_json()
+    ///     .await?;
+    /// # let _ = answer;
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[must_use]
+    pub fn retry_on_status(mut self, status: StatusCode) -> Self {
+        self.retry_on.push(status);
+        self
+    }
+
+    /// Override the per-attempt timeout for this request.
+    ///
+    /// Takes precedence over the client's
+    /// [`attempt_timeout`](crate::ServiceClientBuilder::attempt_timeout) and
+    /// [`timeout`](crate::ServiceClientBuilder::timeout) for every attempt of
+    /// this request, including with a client supplied via
+    /// [`with_http_client`](crate::ServiceClientBuilder::with_http_client).
+    /// Under a deadline an attempt gets the smaller of this and the time
+    /// remaining.
+    ///
+    /// **Supplied client under a deadline:** a client passed to
+    /// [`with_http_client`](crate::ServiceClientBuilder::with_http_client) does
+    /// not expose its own timeout, and reqwest applies one timeout per request.
+    /// So under a deadline, that client's own timeout is **replaced** on every
+    /// attempt by the remaining budget. To keep a tighter per-attempt bound,
+    /// set [`ServiceClientBuilder::attempt_timeout`](crate::ServiceClientBuilder::attempt_timeout)
+    /// (client-wide) or this method (one request).
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use acton_service_client::{Method, ServiceClient};
+    /// use std::time::Duration;
+    /// # async fn run(client: ServiceClient) -> Result<(), acton_service_client::ClientError> {
+    /// client
+    ///     .request(Method::GET, "slow-report")
+    ///     .timeout(Duration::from_secs(120))
+    ///     .send_no_content()
+    ///     .await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[must_use]
+    pub fn timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = Some(timeout);
+        self
+    }
+
+    /// Bound this request, every attempt and pause included, by the absolute
+    /// `deadline`.
+    ///
+    /// Overrides the policy's relative [`deadline`](crate::RetryPolicy::deadline)
+    /// for this request, and applies whether or not a retry policy is
+    /// configured. Because it is absolute, several requests that make up one
+    /// logical operation can share one budget: compute the instant once and
+    /// pass it to each, and each request gets only what the earlier ones left.
+    ///
+    /// A request whose deadline has already passed is not sent: it fails at
+    /// once with a non-retriable [`ClientError::DeadlineExceeded`]. Once a
+    /// request has been sent, running out of budget returns the last attempt's
+    /// error or response instead (an attempt cut short by the deadline is a
+    /// [`ClientError::Transport`] timeout).
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use acton_service_client::{Method, ServiceClient};
+    /// use std::time::{Duration, Instant};
+    /// # async fn run(client: ServiceClient) -> Result<(), acton_service_client::ClientError> {
+    /// let deadline = Instant::now() + Duration::from_secs(2);
+    /// client
+    ///     .request(Method::PUT, "reservations/7")
+    ///     .deadline_at(deadline)
+    ///     .send_no_content()
+    ///     .await?;
+    /// // The confirmation gets whatever the reservation left of the 2 seconds.
+    /// client
+    ///     .request(Method::PUT, "reservations/7/confirm")
+    ///     .deadline_at(deadline)
+    ///     .send_no_content()
+    ///     .await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[must_use]
+    pub fn deadline_at(mut self, deadline: Instant) -> Self {
+        self.deadline_at = Some(deadline);
         self
     }
 
@@ -236,25 +369,56 @@ impl RequestBuilder {
         headers
     }
 
-    /// Execute the request, applying the retry policy, and return the raw
-    /// response for any status treated as success.
+    /// Execute the request, applying the retry policy and any deadline, and
+    /// return the raw response for any status treated as success.
+    ///
+    /// When retries are exhausted (by `max_attempts` or the deadline), the last
+    /// error or response is returned exactly as a single attempt would return it.
     ///
     /// # Errors
     ///
     /// Returns [`ClientError::Api`] for non-success statuses, or
     /// [`ClientError::Transport`] / [`ClientError::Config`] for lower-level
-    /// failures.
+    /// failures. An attempt cut short by the deadline is a
+    /// [`ClientError::Transport`] timeout. A request whose deadline passed
+    /// before its first attempt is not sent and fails with
+    /// [`ClientError::DeadlineExceeded`].
     pub async fn send(self) -> Result<reqwest::Response, ClientError> {
+        self.execute(fastrand::f64).await
+    }
+
+    /// The send loop, with the jitter randomness injected so tests can pin it.
+    async fn execute(
+        self,
+        mut draw: impl FnMut() -> f64,
+    ) -> Result<reqwest::Response, ClientError> {
+        let started = Instant::now();
         let url = url::Url::parse(&self.url_string())
             .map_err(|e| ClientError::Config(format!("invalid request URL: {e}")))?;
         let headers = self.effective_headers();
-        let retry_allowed = self.retry_allowed();
-        let policy = self.client.inner.retry.clone();
-        let http = &self.client.inner.http;
+        let deadline = self.deadline(started);
 
         let mut attempt: u32 = 1;
+        // The outcome of the previous attempt, returned instead of a new one
+        // if the pause before this attempt used up the rest of the budget.
+        let mut last: Option<Result<reqwest::Response, ClientError>> = None;
         loop {
-            let mut rb = http.request(self.method.clone(), url.clone());
+            let remaining = remaining_until(deadline, Instant::now());
+            if remaining == Some(Duration::ZERO) {
+                // Nothing sent yet (no `last`): the budget was spent before
+                // the first attempt.
+                return last.unwrap_or_else(|| {
+                    Err(ClientError::DeadlineExceeded {
+                        attempts: attempt - 1,
+                        elapsed: started.elapsed(),
+                    })
+                });
+            }
+            let mut rb = self
+                .client
+                .inner
+                .http
+                .request(self.method.clone(), url.clone());
             if !self.query.is_empty() {
                 rb = rb.query(&self.query);
             }
@@ -262,43 +426,88 @@ impl RequestBuilder {
             if let Some(body) = &self.body {
                 rb = rb.body(body.clone());
             }
+            if let Some(timeout) = attempt_timeout(
+                self.timeout,
+                self.client.inner.attempt_timeout,
+                self.client.inner.timeout,
+                remaining,
+            ) {
+                rb = rb.timeout(timeout);
+            }
 
-            match rb.send().await {
+            let (outcome, pause) = match rb.send().await {
+                Ok(resp) if resp.status().is_success() => return Ok(resp),
                 Ok(resp) => {
                     let status = resp.status();
-                    if status.is_success() || self.accept_extra.contains(&status) {
-                        return Ok(resp);
+                    let retry_after = parse_retry_after(resp.headers());
+                    let accepted = self.accept_extra.contains(&status);
+                    let retry = wants_retry(status, retry_after, accepted, &self.retry_on);
+                    if accepted {
+                        // Kept unread, so that on exhaustion it is returned intact.
+                        let pause = self.pause_before_retry(
+                            retry,
+                            attempt,
+                            &mut draw,
+                            retry_after,
+                            deadline,
+                        );
+                        (Ok(resp), pause)
+                    } else {
+                        let resp_headers = resp.headers().clone();
+                        let text = resp.text().await.unwrap_or_default();
+                        let api = build_api_error(status, &resp_headers, &text);
+                        let pause = self.pause_before_retry(
+                            retry,
+                            attempt,
+                            &mut draw,
+                            retry_after,
+                            deadline,
+                        );
+                        (Err(ClientError::Api(Box::new(api))), pause)
                     }
-                    let resp_headers = resp.headers().clone();
-                    let text = resp.text().await.unwrap_or_default();
-                    let api = build_api_error(status, &resp_headers, &text);
-                    if let Some(policy) = &policy
-                        && retry_allowed
-                        && api.is_retriable()
-                        && policy.should_retry(attempt)
-                    {
-                        let delay = api
-                            .retry_after
-                            .unwrap_or_else(|| policy.backoff_delay(attempt));
-                        tokio::time::sleep(delay).await;
-                        attempt += 1;
-                        continue;
-                    }
-                    return Err(ClientError::Api(Box::new(api)));
                 }
                 Err(e) => {
-                    if let Some(policy) = &policy {
-                        let transient = e.is_timeout() || e.is_connect();
-                        if retry_allowed && transient && policy.should_retry(attempt) {
-                            tokio::time::sleep(policy.backoff_delay(attempt)).await;
-                            attempt += 1;
-                            continue;
-                        }
-                    }
-                    return Err(ClientError::Transport(e));
+                    let transient = e.is_timeout() || e.is_connect();
+                    let pause =
+                        self.pause_before_retry(transient, attempt, &mut draw, None, deadline);
+                    (Err(ClientError::Transport(e)), pause)
                 }
-            }
+            };
+            let Some(pause) = pause else {
+                return outcome;
+            };
+            last = Some(outcome);
+            tokio::time::sleep(pause).await;
+            attempt += 1;
         }
+    }
+
+    /// The absolute deadline for this send: the per-request override, else the
+    /// policy's relative deadline measured from `started`.
+    fn deadline(&self, started: Instant) -> Option<Instant> {
+        self.deadline_at.or_else(|| {
+            let budget = self.client.inner.retry.as_ref()?.deadline?;
+            started.checked_add(budget)
+        })
+    }
+
+    /// The pause before another attempt, or `None` to stop and return the
+    /// current outcome. `None` unless the outcome is `retriable`, retries apply
+    /// to this request, attempts remain, and the pause ends before the deadline.
+    fn pause_before_retry(
+        &self,
+        retriable: bool,
+        attempt: u32,
+        draw: &mut impl FnMut() -> f64,
+        retry_after: Option<Duration>,
+        deadline: Option<Instant>,
+    ) -> Option<Duration> {
+        if !(retriable && self.retry_allowed()) {
+            return None;
+        }
+        let policy = self.client.inner.retry.as_ref()?;
+        let remaining = remaining_until(deadline, Instant::now());
+        policy.next_pause(attempt, draw(), retry_after, remaining)
     }
 
     /// Send the request and decode a JSON success body into `T`.
@@ -408,6 +617,77 @@ mod tests {
     fn retry_not_allowed_without_policy() {
         let rb = client().request(Method::GET, "x");
         assert!(!rb.retry_allowed());
+    }
+
+    /// Jitter floor, end to end: every draw forced to the minimum, an upstream
+    /// that answers 503 forever, and `max_attempts = u32::MAX`. The floor keeps
+    /// each pause at `base_delay`, so the deadline ends the loop after a bounded
+    /// number of attempts, and the last 503 is what comes back.
+    #[tokio::test]
+    async fn jitter_floor_bounds_attempts_under_a_deadline_with_minimum_draws() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let hits = Arc::new(AtomicUsize::new(0));
+        let counter = hits.clone();
+        let app = axum::Router::new().route(
+            "/api/v1/down",
+            axum::routing::get(move || {
+                counter.fetch_add(1, Ordering::SeqCst);
+                async { (axum::http::StatusCode::SERVICE_UNAVAILABLE, "down") }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let client = ServiceClient::builder(format!("http://{addr}"))
+            .retry(
+                crate::retry::RetryPolicy::default()
+                    .max_attempts(u32::MAX)
+                    .base_delay(Duration::from_millis(20))
+                    .max_delay(Duration::from_secs(1))
+                    .jitter(crate::retry::Jitter::Full)
+                    .deadline(Duration::from_millis(300)),
+            )
+            .build()
+            .unwrap();
+
+        let started = Instant::now();
+        let err = client
+            .request(Method::GET, "down")
+            .execute(|| 0.0)
+            .await
+            .unwrap_err();
+        let elapsed = started.elapsed();
+
+        let api = err.as_api().expect("the last 503 is returned");
+        assert_eq!(api.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let attempts = hits.load(Ordering::SeqCst);
+        // 300ms / 20ms floor: at most 15 pauses, so at most 16 attempts.
+        assert!((2..=16).contains(&attempts), "{attempts} attempts");
+        assert!(elapsed < Duration::from_millis(450), "{elapsed:?}");
+    }
+
+    #[test]
+    fn deadline_at_overrides_the_policy_deadline() {
+        let c = ServiceClient::builder("https://api.example.com")
+            .retry(crate::retry::RetryPolicy::default().deadline(Duration::from_secs(9)))
+            .build()
+            .unwrap();
+        let started = Instant::now();
+        assert_eq!(
+            c.request(Method::GET, "x").deadline(started),
+            Some(started + Duration::from_secs(9))
+        );
+        let at = started + Duration::from_secs(1);
+        assert_eq!(
+            c.request(Method::GET, "x")
+                .deadline_at(at)
+                .deadline(started),
+            Some(at)
+        );
+        assert_eq!(client().request(Method::GET, "x").deadline(started), None);
     }
 
     #[test]
