@@ -16,6 +16,8 @@ use reqwest::header::HeaderMap;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
+use crate::failover::{EndpointSetError, FailoverTrace};
+
 /// Header name for the rate-limit ceiling.
 pub const RATELIMIT_LIMIT: &str = "RateLimit-Limit";
 /// Header name for the remaining rate-limit budget.
@@ -226,13 +228,20 @@ pub enum ClientError {
 
     /// The call's deadline ([`RetryPolicy::deadline`](crate::RetryPolicy::deadline)
     /// or [`RequestBuilder::deadline_at`](crate::RequestBuilder::deadline_at))
-    /// had passed before anything was sent.
+    /// expired.
     ///
-    /// Returned **only when nothing was sent**, so the server has not seen
-    /// this call, and it is not retriable: the budget is spent. Once an attempt
-    /// has gone out, running out of budget returns that attempt's own outcome
-    /// instead (an attempt cut short by the deadline is a
-    /// [`Transport`](Self::Transport) timeout).
+    /// `attempts` requests were started before it did, and **any of them may
+    /// have been applied**. Only `attempts == 0` guarantees that nothing was
+    /// sent and the server has not seen this call. It is not retriable: the
+    /// budget is spent.
+    ///
+    /// Today this crate returns it only with `attempts == 0`, for a deadline
+    /// already spent before the first attempt. Once an attempt has gone out,
+    /// running out of budget returns that attempt's own outcome instead (an
+    /// attempt cut short by the deadline is a [`Transport`](Self::Transport)
+    /// timeout), or [`EndpointsExhausted`](Self::EndpointsExhausted) when the
+    /// call has failed over between endpoints. Match on `attempts` rather than
+    /// relying on that.
     ///
     /// # Examples
     ///
@@ -247,28 +256,71 @@ pub enum ClientError {
     ///     .await
     /// {
     ///     Ok(_) => {}
-    ///     Err(ClientError::DeadlineExceeded { attempts, elapsed }) => {
-    ///         // Nothing reached the server: widen the budget, or re-drive the
-    ///         // operation later under the same idempotency identity.
-    ///         eprintln!("not sent: {attempts} attempts in {elapsed:?}");
+    ///     Err(ClientError::DeadlineExceeded { attempts: 0, elapsed }) => {
+    ///         // Nothing reached the server: widen the budget, or send it later.
+    ///         eprintln!("not sent; {elapsed:?} elapsed");
+    ///     }
+    ///     Err(ClientError::DeadlineExceeded { attempts, .. }) => {
+    ///         // Possibly applied: re-drive under the same idempotency identity.
+    ///         eprintln!("{attempts} attempts may have been applied");
     ///     }
     ///     Err(other) => eprintln!("failed: {other}"),
     /// }
     /// # }
     /// ```
-    #[error(
-        "deadline exceeded before the request was sent ({attempts} attempts sent, {elapsed:?} \
-         elapsed); widen the deadline, or re-drive the operation with the same idempotency \
-         identity"
-    )]
+    #[error("{}", deadline_message(*attempts, *elapsed))]
     DeadlineExceeded {
-        /// Attempts that reached the network before the deadline was found
-        /// spent. Always `0` today, since the variant is returned only when
-        /// nothing was sent.
+        /// Attempts started before the deadline expired; any of them may have
+        /// been applied. Only `0` guarantees nothing was sent.
         attempts: u32,
         /// Time spent inside this call before it gave up.
         elapsed: Duration,
     },
+
+    /// The client's endpoint set was refused when it was built (a duplicate
+    /// origin, mixed schemes, or a failover endpoint that is not a bare
+    /// origin). The message names the endpoint and the fix.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use acton_service_client::{ClientError, ServiceClient};
+    ///
+    /// let err = ServiceClient::builder("https://a.example.com")
+    ///     .failover_endpoint("https://A.example.com:443")
+    ///     .build()
+    ///     .unwrap_err();
+    /// assert!(matches!(err, ClientError::InvalidEndpoints(_)));
+    /// ```
+    #[error("invalid endpoint set: {0}")]
+    InvalidEndpoints(#[from] EndpointSetError),
+
+    /// A call over an endpoint set ran out of budget (its deadline or
+    /// `max_attempts`) after failing over at least once.
+    ///
+    /// The [`FailoverTrace`] lists every attempt in order, with its endpoint
+    /// and outcome, and carries the final attempt's own error in
+    /// [`last`](FailoverTrace::last). When `attempts` is non-empty, **any
+    /// attempt may have been applied** unless
+    /// [`FailoverTrace::proves_not_processed`] says otherwise. It is not
+    /// retriable: the budget is spent. Boxed to keep [`ClientError`] small.
+    ///
+    /// A client with a single endpoint never returns it.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use acton_service_client::{ClientError, Method, ServiceClient};
+    /// # async fn run(client: ServiceClient) {
+    /// if let Err(ClientError::EndpointsExhausted(trace)) =
+    ///     client.request(Method::GET, "orders/7").send().await
+    /// {
+    ///     eprintln!("{} attempts; last: {}", trace.attempts.len(), trace.last);
+    /// }
+    /// # }
+    /// ```
+    #[error(transparent)]
+    EndpointsExhausted(Box<FailoverTrace>),
 }
 
 impl From<ApiError> for ClientError {
@@ -290,15 +342,56 @@ impl ClientError {
     /// Whether this error is worth retrying.
     ///
     /// Transport errors that are timeouts or connection failures are retriable;
-    /// API errors defer to [`ApiError::is_retriable`]; decode, config, and
-    /// deadline-exceeded errors are never retriable.
+    /// API errors defer to [`ApiError::is_retriable`]; decode, config,
+    /// endpoint-set, deadline-exceeded and endpoints-exhausted errors are never
+    /// retriable.
     #[must_use]
     pub fn is_retriable(&self) -> bool {
         match self {
             Self::Api(e) => e.is_retriable(),
             Self::Transport(e) => e.is_timeout() || e.is_connect(),
-            Self::Decode { .. } | Self::Config(_) | Self::DeadlineExceeded { .. } => false,
+            Self::Decode { .. }
+            | Self::Config(_)
+            | Self::DeadlineExceeded { .. }
+            | Self::InvalidEndpoints(_)
+            | Self::EndpointsExhausted(_) => false,
         }
+    }
+
+    /// The failover trace, when this error ended a call that failed over
+    /// between endpoints ([`EndpointsExhausted`](Self::EndpointsExhausted)).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use acton_service_client::ClientError;
+    ///
+    /// let err = ClientError::Config("bad".into());
+    /// assert!(err.failover_trace().is_none());
+    /// ```
+    #[must_use]
+    pub fn failover_trace(&self) -> Option<&FailoverTrace> {
+        match self {
+            Self::EndpointsExhausted(trace) => Some(trace),
+            _ => None,
+        }
+    }
+}
+
+/// The [`ClientError::DeadlineExceeded`] message: whether anything may have
+/// been applied depends on `attempts`.
+fn deadline_message(attempts: u32, elapsed: Duration) -> String {
+    if attempts == 0 {
+        format!(
+            "deadline exceeded before anything was sent ({elapsed:?} elapsed); widen the \
+             deadline, or send the operation again later"
+        )
+    } else {
+        format!(
+            "deadline exceeded after {attempts} attempts were started ({elapsed:?} elapsed), and \
+             any of them may have been applied; widen the deadline, or re-drive the operation \
+             with the same idempotency identity"
+        )
     }
 }
 
@@ -542,10 +635,18 @@ mod tests {
         assert!(err.as_api().is_none());
         let text = err.to_string();
         assert!(
-            text.contains("deadline exceeded before the request was sent"),
+            text.contains("deadline exceeded before anything was sent"),
             "{text}"
         );
         assert!(text.contains("widen the deadline"), "{text}");
+
+        let started = ClientError::DeadlineExceeded {
+            attempts: 2,
+            elapsed: Duration::from_millis(3),
+        };
+        let text = started.to_string();
+        assert!(text.contains("after 2 attempts were started"), "{text}");
+        assert!(text.contains("may have been applied"), "{text}");
         assert!(text.contains("same idempotency identity"), "{text}");
     }
 }

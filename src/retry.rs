@@ -17,9 +17,7 @@
 
 use std::time::{Duration, Instant};
 
-use reqwest::{Method, StatusCode};
-
-use crate::error::status_is_retriable;
+use reqwest::Method;
 
 /// How a retry pause is spread below its exponential ceiling.
 ///
@@ -425,6 +423,11 @@ impl RetryPolicy {
     /// Stops when `max_attempts` is spent or when the pause would reach the
     /// deadline. A server `Retry-After` replaces the computed pause (unjittered,
     /// uncapped, as in 0.1) but is still refused if it would reach the deadline.
+    ///
+    /// This is 0.2.0's single-endpoint decision, kept as the oracle the
+    /// failover state machine is tested against: with one endpoint it must
+    /// decide exactly this.
+    #[cfg(test)]
     pub(crate) fn next_pause(
         &self,
         attempt: u32,
@@ -471,7 +474,7 @@ fn spread(span: u64, draw: f64) -> u64 {
 }
 
 /// `Some(pause)` unless a deadline exists and the pause would end at or after it.
-fn fits_before(pause: Duration, remaining: Option<Duration>) -> Option<Duration> {
+pub(crate) fn fits_before(pause: Duration, remaining: Option<Duration>) -> Option<Duration> {
     match remaining {
         Some(left) if pause >= left => None,
         _ => Some(pause),
@@ -517,13 +520,18 @@ pub(crate) fn attempt_timeout(
 /// the accepted list). Otherwise an accepted status is returned as-is, and any
 /// other status is retried when it is retriable by default (see
 /// [`ApiError::is_retriable`](crate::ApiError::is_retriable)).
+///
+/// This is 0.2.0's rule, kept as the oracle for the failover classification:
+/// a status is retried (rotated or retried in place) exactly when this holds.
+#[cfg(test)]
 pub(crate) fn wants_retry(
-    status: StatusCode,
+    status: reqwest::StatusCode,
     retry_after: Option<Duration>,
     accepted: bool,
-    retry_on: &[StatusCode],
+    retry_on: &[reqwest::StatusCode],
 ) -> bool {
-    retry_on.contains(&status) || (!accepted && status_is_retriable(status, retry_after))
+    retry_on.contains(&status)
+        || (!accepted && crate::error::status_is_retriable(status, retry_after))
 }
 
 /// Whether an HTTP method is idempotent and therefore safe to retry by default.
@@ -553,6 +561,7 @@ pub fn is_idempotent(method: &Method) -> bool {
 mod tests {
     use super::*;
     use crate::error::build_api_error;
+    use reqwest::StatusCode;
     use reqwest::header::HeaderMap;
 
     fn ms(n: u64) -> Duration {

@@ -1,6 +1,6 @@
 [package]
 name = "acton-service-client"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 license = "MIT"
 description = "Typed async HTTP client for services built on the acton-service framework. Encodes acton-service's fixed wire conventions (error bodies, versioned routes, health/readiness, request-tracking headers, rate limiting) so consumers don't reinvent them."
@@ -22,4 +22,6 @@ uuid = { version = "1.23.4", features = ["v4"] }
 
 [dev-dependencies]
 axum = "0.8.9"
+opentelemetry = "0.33.0"
 tokio = { version = "1.52.3", features = ["full"] }
+tracing = "0.1.44"

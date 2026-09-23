@@ -119,8 +119,17 @@ Every fallible call returns `ClientError`:
 - **`Decode { status, snippet, source }`** — a success body that failed to
   deserialize; keeps a truncated snippet for diagnostics.
 - **`Config(String)`** — builder-time validation (e.g. bad base URL).
-- **`DeadlineExceeded { attempts, elapsed }`** — the call's deadline passed
-  before anything was sent. Not retriable.
+- **`DeadlineExceeded { attempts, elapsed }`**: the call's deadline expired
+  after `attempts` requests were started, and any of them may have been
+  applied. Only `attempts == 0` guarantees nothing was sent (today the crate
+  returns it only in that case). Not retriable.
+- **`InvalidEndpoints(EndpointSetError)`**: the endpoint set was refused at
+  build time (duplicate origin, mixed schemes, or a failover endpoint that is
+  not a bare origin).
+- **`EndpointsExhausted(Box<FailoverTrace>)`**: a call over an endpoint set ran
+  out of budget after failing over. The trace lists every attempt (endpoint,
+  outcome, whether it rotated) and the final attempt's own error. Not
+  retriable.
 
 `ClientError` is `#[non_exhaustive]`: match it with a wildcard arm.
 
@@ -187,6 +196,108 @@ let answer: Answer = client
 
 Defaults (no deadline, no jitter, no extra statuses) behave exactly as 0.1.
 
+## Endpoint failover
+
+Give a client an ordered set of endpoints serving the same API, and one
+deadline covers every attempt on every endpoint:
+
+```rust,no_run
+# use acton_service_client::{
+#     ClientError, EndpointOrigin, Method, RetryObserver, RetryPolicy, RetryReason, ServiceClient,
+#     StatusCode,
+# };
+# use std::time::Duration;
+# async fn run() -> Result<(), ClientError> {
+struct Log;
+
+impl RetryObserver for Log {
+    fn on_rotation(&self, left: &EndpointOrigin, reason: RetryReason) {
+        eprintln!("left {left}: {}", reason.label()); // or count it as a metric
+    }
+}
+
+let client = ServiceClient::builder("https://replica-a.example.com")
+    .failover_endpoints(["https://replica-b.example.com", "https://replica-c.example.com"])
+    .attempt_timeout(Duration::from_secs(5))
+    .retry(RetryPolicy::default().max_attempts(u32::MAX).deadline(Duration::from_secs(15)))
+    .retry_observer(Log)
+    .build()?;
+
+match client
+    .request(Method::POST, "authorize")
+    .retriable(true)
+    .retry_on_status(StatusCode::MISDIRECTED_REQUEST)
+    .send()
+    .await
+{
+    Err(ClientError::EndpointsExhausted(trace)) if trace.proves_not_processed() => {
+        // Every endpoint refused it (421 or connect): nothing was applied.
+    }
+    other => { let _ = other?; }
+}
+# Ok(())
+# }
+```
+
+- **Validated at build.** Failover endpoints are bare origins
+  (`scheme://host[:port]`); each request reuses the base URL's path. Duplicate
+  origins (after normalization) and mixed schemes are a typed
+  `ClientError::InvalidEndpoints`, never a panic. `Endpoint::with_http_client`
+  gives one endpoint its own client (for example its own TLS configuration).
+- **Retriable requests only.** Failover follows the retry rules: idempotent
+  methods, or `.retriable(true)`. A request that is not retried goes to one
+  endpoint only, exactly as without a set.
+- **Rotation.** A `retry_on_status` status, a connect failure, or an attempt
+  timeout moves the next attempt to the next endpoint at once. After a full
+  cycle, the client pauses with the policy's backoff (or the smallest
+  `Retry-After`, when every endpoint in the cycle sent one). Statuses retriable
+  by default but not listed (`429`, `502`, `503`, `504`) retry the same
+  endpoint, and every other answer is returned, as before. A transport failure
+  after the request was written (a reset mid-body) is not a connect failure:
+  it is returned as `ClientError::Transport` and never retried, exactly as in
+  0.2.0, since the endpoint may have processed it and a patch release must not
+  change what a single-endpoint caller sees. Treat it as ambiguous and re-send
+  with the same idempotency identity.
+- **Sticky.** The next call starts at the endpoint that last gave a definitive
+  answer (any status that is not a rotation status, a `4xx` included).
+- **Stays in the set.** A built client follows redirects only within the set;
+  a supplied client that follows one out of it fails with `ClientError::Config`.
+- **Diagnosable.** Running out of budget after a rotation returns
+  `EndpointsExhausted` with the trace. Every response `send` returns carries
+  its own trace too, read with `AttemptTrace::of(&response)`: the attempts
+  that asked for another try, ending with the response itself when the budget
+  ran out on an accepted status. `RetryReason::proves_not_processed`
+  is true only for a connect failure and `421`.
+- **Metrics.** A `RetryObserver` hears of every re-send: `on_rotation` when
+  the call moves to the next endpoint, `on_retry` when it re-sends to the same
+  one (so a single-endpoint client answering `421` is visible too). Both
+  default to doing nothing, and the crate has no metrics dependency. In an
+  `acton-service` application, count them on
+  `acton_service::observability::get_meter()` as
+  `acton_service_client.endpoint.rotations{reason}` and
+  `acton_service_client.endpoint.retries{reason}`, with `reason.label()`.
+  The observer runs synchronously on the caller's task.
+- **Per request.** `RequestBuilder::retry_observer` installs an observer on
+  one request, called in addition to the client's (the client's first). A
+  request's observer hears exactly that request's re-sends, every attempt but
+  the last, in order, with its outcome; the request's result is the last.
+  That is the complete per-attempt record of one call, on the success path
+  and under concurrency. The client's observer hears the union of every
+  request's re-sends: in order within each request, with no order promised
+  across concurrent requests, which is right for counters and wrong for
+  deciding what happened to one call. To derive a per-call answer (such as
+  "not submitted anywhere"), install a fresh collector on that request.
+- **Where the record lives.** An `Ok` response carries its attempts in
+  `AttemptTrace::of(&response)`. `EndpointsExhausted` carries every attempt in
+  its `FailoverTrace`. `DeadlineExceeded` and every other error (a single
+  endpoint's, or a call that never rotated, returned exactly as in 0.2.0) carry
+  no trace: the request's own observer is the record there, and it covers the
+  other paths too.
+- **Parity.** `spec/fixtures/endpoint-failover-v1.json` pins the rules for
+  every port; the Rust crate runs it on a virtual clock and over real HTTP.
+
+A client with one endpoint behaves exactly as 0.2.0.
+
 ## Feature table
 
 | Area | What you get |
@@ -199,6 +310,7 @@ Defaults (no deadline, no jitter, no extra statuses) behave exactly as 0.1.
 | Rate limits | `RateLimitInfo` surfaced on `ApiError` |
 | Auth | Bearer tokens (JWT or PASETO, opaque to the client) |
 | Retries | Opt-in `RetryPolicy`: pure backoff math, floored jitter, total deadline, per-request extra statuses and timeouts |
+| Failover | Ordered endpoint set under one deadline: validated at build, sticky, in-set redirects only, typed trace on exhaustion, retry observer |
 
 ## Development
 

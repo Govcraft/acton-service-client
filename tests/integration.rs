@@ -14,6 +14,9 @@
 //! environment-sensitive for proving wire-shape mirroring. Every JSON body and
 //! header below is byte-for-byte what `acton-service` emits.
 
+#[path = "support/refused.rs"]
+mod refused;
+
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -983,14 +986,11 @@ async fn default_policy_reproduces_0_1_2_attempts_and_delays() {
 /// is retried three times with 100ms and 200ms pauses.
 #[tokio::test]
 async fn default_policy_retries_connect_failures_on_the_0_1_2_schedule() {
-    // Bind then drop, so the port refuses connections.
-    let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
-        .await
-        .unwrap();
-    let addr = listener.local_addr().unwrap();
-    drop(listener);
+    // Bound but never listening, so the port refuses connections and no
+    // concurrently started server can take it.
+    let refused = refused::Refused::bind();
 
-    let client = retrying_client(&format!("http://{addr}"), RetryPolicy::default());
+    let client = retrying_client(&refused.url(), RetryPolicy::default());
     let started = std::time::Instant::now();
     let err = client
         .get::<serde_json::Value>("anything")
