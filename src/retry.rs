@@ -494,23 +494,24 @@ pub(crate) fn remaining_until(deadline: Option<Instant>, now: Instant) -> Option
 ///
 /// 1. `request`: the per-request override ([`RequestBuilder::timeout`](crate::RequestBuilder::timeout));
 /// 2. `client_attempt`: the client-wide [`ServiceClientBuilder::attempt_timeout`](crate::ServiceClientBuilder::attempt_timeout);
-/// 3. `builder`: the builder's `timeout`, `None` for a supplied client whose
-///    own timeout cannot be observed; consulted only under a deadline, since
-///    without one it is already the HTTP client's own timeout;
+/// 3. `builder`: the builder's [`timeout`](crate::ServiceClientBuilder::timeout),
+///    for a built and a supplied client alike (a supplied client's own timeout
+///    cannot be read, so it is never relied on); `None` only after
+///    [`no_timeout`](crate::ServiceClientBuilder::no_timeout);
 /// 4. `remaining` itself.
 ///
-/// With no deadline and neither of the first two, the request carries no
-/// timeout of its own, exactly as in 0.1.
+/// Only with none of the first three and no deadline does the request carry
+/// no timeout of its own, leaving the HTTP client's.
 pub(crate) fn attempt_timeout(
     request: Option<Duration>,
     client_attempt: Option<Duration>,
     builder: Option<Duration>,
     remaining: Option<Duration>,
 ) -> Option<Duration> {
-    let configured = request.or(client_attempt);
+    let configured = request.or(client_attempt).or(builder);
     match remaining {
         None => configured,
-        Some(left) => Some(configured.or(builder).map_or(left, |own| own.min(left))),
+        Some(left) => Some(configured.map_or(left, |own| own.min(left))),
     }
 }
 
@@ -770,10 +771,10 @@ mod tests {
         type Opt = Option<Duration>;
         let table: [Row; 20] = [
             // request, client attempt, builder, remaining => expected
-            // No deadline: only the opt-in levels set a per-request timeout.
-            (None, None, None, None, None),
-            (None, None, bld, None, None), // 0.1: client keeps its own
-            (None, att, None, None, att),  // supplied client, opted in
+            // No deadline: the highest level present wins.
+            (None, None, None, None, None), // no_timeout: the client keeps its own
+            (None, None, bld, None, bld),   // built or supplied client alike
+            (None, att, None, None, att),
             (None, att, bld, None, att),
             (req, None, None, None, req),
             (req, att, bld, None, req), // request wins
@@ -803,8 +804,8 @@ mod tests {
                 "request={request:?} attempt={client_attempt:?} builder={builder:?} remaining={remaining:?}"
             );
         }
-        // The reviewer's case: a supplied client (no builder timeout) with a
-        // 5s attempt_timeout under a 15s deadline gets 5s per attempt.
+        // A client after no_timeout with a 5s attempt_timeout under a 15s
+        // deadline gets 5s per attempt.
         assert_eq!(
             attempt_timeout(None, Some(s(5)), None, Some(s(15))),
             Some(s(5))
@@ -892,10 +893,11 @@ mod tests {
         }
         // 429/502/503/504 with and without Retry-After, 423 only with it.
         assert_eq!(retried, 4 * 2 + 1);
-        // No override, no attempt_timeout, no deadline: no per-request timeout.
+        // No override, no attempt_timeout, no deadline: the builder's 30s,
+        // which 0.1 baked into the client it built, now goes with each request.
         assert_eq!(
             attempt_timeout(None, None, Some(Duration::from_secs(30)), None),
-            None
+            Some(Duration::from_secs(30))
         );
     }
 

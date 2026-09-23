@@ -102,9 +102,11 @@ let client = ServiceClient::builder("https://api.example.com")
 # }
 ```
 
-`bearer_token` and `default_header` are sent per-request, so they keep working
-with a supplied client. Only `timeout` is ignored on this path — set it on the
-client you pass in.
+`bearer_token`, `default_header` and `timeout` are applied per request, so
+they hold with a supplied client too. The builder's `timeout` (30s unless
+changed) replaces the supplied client's own on every attempt, so a client
+built without one cannot hang a request forever. To keep the supplied
+client's own timeout, opt out explicitly with `.no_timeout()`.
 
 ## Error handling
 
@@ -185,10 +187,10 @@ let answer: Answer = client
   hammered in a tight loop.
 - **Per-attempt timeout.** The request's `.timeout()` wins, then the client's
   `ServiceClientBuilder::attempt_timeout`, then the builder's `timeout`. Under a
-  deadline, whichever applies is clamped to the time remaining. With a client
-  supplied via `with_http_client`, a deadline **replaces** that client's own
-  timeout with the remaining budget on every attempt. Set `attempt_timeout` to
-  keep a tighter bound.
+  deadline, whichever applies is clamped to the time remaining. All three apply
+  per request, on a built or supplied client alike. Only after `.no_timeout()`
+  does an attempt carry none of its own; a deadline then bounds it by the time
+  remaining.
 - **Extra statuses.** `RequestBuilder::retry_on_status` extends the retriable
   set per request. It is checked before `accept_status`, so an accepted status
   listed for retry is retried first and still returned raw once retries run

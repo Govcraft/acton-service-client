@@ -104,9 +104,9 @@ impl Endpoint {
     /// Use it when one endpoint needs its own TLS configuration (a different
     /// root store or client certificate). It is treated like a client passed
     /// to [`with_http_client`](crate::ServiceClientBuilder::with_http_client):
-    /// the builder's [`timeout`](crate::ServiceClientBuilder::timeout) does
-    /// not apply to it, so bound its attempts with
-    /// [`attempt_timeout`](crate::ServiceClientBuilder::attempt_timeout). Build
+    /// the builder's [`timeout`](crate::ServiceClientBuilder::timeout) bounds
+    /// its attempts and replaces its own timeout, unless the builder opts out
+    /// with [`no_timeout`](crate::ServiceClientBuilder::no_timeout). Build
     /// it with [`reqwest::redirect::Policy::none`] (or a policy limited to the
     /// set): a redirect that leaves the set is refused with
     /// [`ClientError::Config`].

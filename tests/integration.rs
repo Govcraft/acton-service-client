@@ -1007,7 +1007,7 @@ async fn default_policy_retries_connect_failures_on_the_0_1_2_schedule() {
 
 // ---------------------------------------------------------------------------
 // Per-attempt timeout precedence: request > attempt_timeout > builder timeout
-// (built client only) > remaining, always clamped to the deadline.
+// (built or supplied client) > remaining, always clamped to the deadline.
 // ---------------------------------------------------------------------------
 
 /// A server that holds every request for far longer than any test waits.
@@ -1071,21 +1071,85 @@ async fn supplied_client_timeout_is_replaced_by_the_remaining_budget() {
     assert_near(elapsed, Duration::from_millis(150));
 }
 
-/// Without a deadline the supplied client's own timeout is left alone.
+/// Issue #6: a supplied client with no timeout of its own, no deadline, and a
+/// stalled server. 0.2.0 sent the request with no timeout at all, so it hung
+/// forever; the builder's timeout now bounds it and the call fails with the
+/// typed timeout error at that bound.
 #[tokio::test]
-async fn supplied_client_keeps_its_own_timeout_without_a_deadline() {
-    let (base, _hits) = spawn_stalled().await;
-    let supplied = acton_service_client::reqwest::Client::builder()
-        .timeout(Duration::from_millis(150))
-        .build()
-        .unwrap();
+async fn supplied_client_without_a_timeout_is_bounded_by_the_builder_timeout() {
+    let (base, hits) = spawn_stalled().await;
+    let no_timeout = acton_service_client::reqwest::Client::new();
     let client = ServiceClient::builder(&base)
-        .with_http_client(supplied)
+        .with_http_client(no_timeout)
+        .timeout(Duration::from_millis(300))
         .build()
         .unwrap();
     let elapsed =
         time_to_timeout(client.request(acton_service_client::Method::GET, "scripted")).await;
+    assert_near(elapsed, Duration::from_millis(300));
+    assert_eq!(hit_count(&hits), 1);
+}
+
+/// The same bound on a failover endpoint's own client
+/// (`Endpoint::with_http_client`): the base URL refuses, the call moves to the
+/// backup, and the backup's timeout-less client is bounded by the builder's
+/// timeout. The timeout is the last error of the exhausted call.
+#[tokio::test]
+async fn failover_endpoint_client_without_a_timeout_is_bounded_by_the_builder_timeout() {
+    let (backup, hits) = spawn_stalled().await;
+    let dead = refused::Refused::bind();
+    let client = ServiceClient::builder(dead.url())
+        .failover_endpoint(
+            acton_service_client::Endpoint::new(backup)
+                .with_http_client(acton_service_client::reqwest::Client::new()),
+        )
+        .timeout(Duration::from_millis(300))
+        .retry(RetryPolicy::default().max_attempts(2))
+        .build()
+        .unwrap();
+    let started = std::time::Instant::now();
+    let err = client
+        .request(acton_service_client::Method::GET, "scripted")
+        .send()
+        .await
+        .unwrap_err();
+    assert_near(started.elapsed(), Duration::from_millis(300));
+    let trace = err
+        .failover_trace()
+        .expect("the call rotated, so it carries a trace");
+    assert_timeout(&trace.last);
+    assert_eq!(hit_count(&hits), 1);
+}
+
+/// The explicit opt-out: after `no_timeout()`, and without a deadline, the
+/// supplied client's own timeout is the one that fires.
+#[tokio::test]
+async fn supplied_client_keeps_its_own_timeout_only_after_no_timeout() {
+    let (base, _hits) = spawn_stalled().await;
+    let supplied = || {
+        acton_service_client::reqwest::Client::builder()
+            .timeout(Duration::from_millis(150))
+            .build()
+            .unwrap()
+    };
+    let opted_out = ServiceClient::builder(&base)
+        .with_http_client(supplied())
+        .no_timeout()
+        .build()
+        .unwrap();
+    let elapsed =
+        time_to_timeout(opted_out.request(acton_service_client::Method::GET, "scripted")).await;
     assert_near(elapsed, Duration::from_millis(150));
+
+    // Without the opt-out the builder's timeout replaces the client's own.
+    let bounded = ServiceClient::builder(&base)
+        .with_http_client(supplied())
+        .timeout(Duration::from_millis(400))
+        .build()
+        .unwrap();
+    let elapsed =
+        time_to_timeout(bounded.request(acton_service_client::Method::GET, "scripted")).await;
+    assert_near(elapsed, Duration::from_millis(400));
 }
 
 /// The reviewer's case: a supplied client with a 5s `attempt_timeout` under a
