@@ -16,15 +16,13 @@ use crate::request::RequestBuilder;
 use crate::retry::RetryPolicy;
 use crate::versioning::ApiVersion;
 
+/// The builder's timeout until [`ServiceClientBuilder::timeout`] or
+/// [`ServiceClientBuilder::no_timeout`] changes it.
+const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// How one endpoint of the set is reached.
 pub(crate) struct Slot {
     pub(crate) http: reqwest::Client,
-    /// The timeout the builder baked into `http`, or `None` when the client
-    /// was supplied (via [`ServiceClientBuilder::with_http_client`] or
-    /// [`Endpoint::with_http_client`]), whose own timeout cannot be observed.
-    /// Consulted only under a deadline, as the last fallback before
-    /// `remaining`.
-    pub(crate) timeout: Option<Duration>,
 }
 
 /// Shared, cheaply-cloneable client configuration.
@@ -45,6 +43,10 @@ pub(crate) struct Inner {
     /// The client-wide per-attempt timeout
     /// ([`ServiceClientBuilder::attempt_timeout`]), for any HTTP client.
     pub(crate) attempt_timeout: Option<Duration>,
+    /// The builder's [`timeout`](ServiceClientBuilder::timeout), sent with
+    /// every attempt on every endpoint, built or supplied client alike;
+    /// `None` only after [`ServiceClientBuilder::no_timeout`].
+    pub(crate) timeout: Option<Duration>,
     /// Headers applied to every request (bearer token plus any
     /// [`ServiceClientBuilder::default_header`]). Held here rather than baked
     /// into the [`reqwest::Client`] so they apply equally to a client supplied
@@ -278,7 +280,7 @@ pub struct ServiceClientBuilder {
     base_path: String,
     version: ApiVersion,
     bearer_token: Option<String>,
-    timeout: Duration,
+    timeout: Option<Duration>,
     attempt_timeout: Option<Duration>,
     retry: Option<RetryPolicy>,
     default_headers: HeaderMap,
@@ -294,7 +296,7 @@ impl ServiceClientBuilder {
             base_path: "/api".to_string(),
             version: ApiVersion::V1,
             bearer_token: None,
-            timeout: Duration::from_secs(30),
+            timeout: Some(DEFAULT_TIMEOUT),
             attempt_timeout: None,
             retry: None,
             default_headers: HeaderMap::new(),
@@ -326,19 +328,23 @@ impl ServiceClientBuilder {
         self
     }
 
-    /// Set the timeout of the HTTP client the builder constructs (default 30s).
+    /// Bound every attempt of every request (default 30s).
     ///
-    /// Each attempt, including each retry, gets this long. Under a deadline
-    /// ([`RetryPolicy::deadline`] or
+    /// Each attempt, including each retry, is sent with this as its reqwest
+    /// per-request timeout, so it holds whether the builder constructs the
+    /// HTTP client or you supply one through
+    /// [`with_http_client`](Self::with_http_client) or
+    /// [`Endpoint::with_http_client`]: on a supplied client it replaces the
+    /// client's own timeout. Under a deadline ([`RetryPolicy::deadline`] or
     /// [`RequestBuilder::deadline_at`](crate::RequestBuilder::deadline_at)) an
     /// attempt gets the smaller of this and the time remaining.
     /// [`attempt_timeout`](Self::attempt_timeout) and
     /// [`RequestBuilder::timeout`](crate::RequestBuilder::timeout) take
-    /// precedence over it.
+    /// precedence over it. To send attempts with no timeout from the builder,
+    /// say so with [`no_timeout`](Self::no_timeout).
     ///
-    /// Ignored with a client supplied via
-    /// [`with_http_client`](Self::with_http_client); use
-    /// [`attempt_timeout`](Self::attempt_timeout) there.
+    /// When it fires, the call fails with a [`ClientError::Transport`] whose
+    /// error reports `is_timeout()`.
     ///
     /// # Examples
     ///
@@ -354,7 +360,48 @@ impl ServiceClientBuilder {
     /// ```
     #[must_use]
     pub fn timeout(mut self, timeout: Duration) -> Self {
-        self.timeout = timeout;
+        self.timeout = Some(timeout);
+        self
+    }
+
+    /// Send attempts without the builder's timeout: the explicit opt-out from
+    /// the 30s default and from any [`timeout`](Self::timeout) set before.
+    ///
+    /// A client the builder constructs then has no timeout at all, and a
+    /// supplied client (through [`with_http_client`](Self::with_http_client)
+    /// or [`Endpoint::with_http_client`]) keeps its own, whatever it is
+    /// (reqwest's default is none). An attempt can then wait forever on a
+    /// server that accepts the connection and never answers, so prefer a
+    /// longer [`timeout`](Self::timeout), or bound the call with a
+    /// [`RetryPolicy::deadline`].
+    ///
+    /// Still in force: [`attempt_timeout`](Self::attempt_timeout),
+    /// [`RequestBuilder::timeout`](crate::RequestBuilder::timeout), and a
+    /// deadline, which bounds every attempt by the time remaining (on a
+    /// supplied client, in place of its own timeout). A later
+    /// [`timeout`](Self::timeout) call sets a timeout again.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use acton_service_client::ServiceClient;
+    /// use std::time::Duration;
+    ///
+    /// // A long-poll client that relies on its own 10-minute timeout.
+    /// let long_poll = acton_service_client::reqwest::Client::builder()
+    ///     .timeout(Duration::from_secs(600))
+    ///     .build()
+    ///     .expect("a reqwest client");
+    /// let client = ServiceClient::builder("https://api.example.com")
+    ///     .with_http_client(long_poll)
+    ///     .no_timeout()
+    ///     .build()
+    ///     .expect("valid base url");
+    /// # let _ = client;
+    /// ```
+    #[must_use]
+    pub fn no_timeout(mut self) -> Self {
+        self.timeout = None;
         self
     }
 
@@ -362,23 +409,22 @@ impl ServiceClientBuilder {
     /// client.
     ///
     /// Each attempt, including each retry, is sent with this as its reqwest
-    /// per-request timeout, clamped to the time remaining under a deadline.
-    /// This is the way to bound attempts on a client supplied via
-    /// [`with_http_client`](Self::with_http_client), whose own timeout is
-    /// otherwise replaced by the remaining budget under a deadline.
+    /// per-request timeout, clamped to the time remaining under a deadline. It
+    /// overrides the builder's [`timeout`](Self::timeout), and a
+    /// [`no_timeout`](Self::no_timeout), for every request of the client.
     ///
     /// The timeout for one attempt is chosen in this order, and in every case
     /// clamped to the time remaining before the deadline, if there is one:
     ///
     /// 1. the request's [`RequestBuilder::timeout`](crate::RequestBuilder::timeout);
     /// 2. this client-wide `attempt_timeout`;
-    /// 3. the builder's [`timeout`](Self::timeout), for a client the builder
-    ///    constructs (under a deadline only; otherwise it is already the
-    ///    client's own timeout);
-    /// 4. with none of these, the remaining budget itself.
+    /// 3. the builder's [`timeout`](Self::timeout) (30s unless changed), on a
+    ///    built or supplied client alike;
+    /// 4. after [`no_timeout`](Self::no_timeout), the remaining budget itself.
     ///
-    /// Without a deadline and without either of the first two, no per-request
-    /// timeout is set at all, exactly as in 0.1.
+    /// Only after [`no_timeout`](Self::no_timeout), with no deadline and
+    /// neither of the first two, is an attempt sent without a timeout of its
+    /// own: a supplied client's own timeout then applies.
     ///
     /// # Examples
     ///
@@ -430,21 +476,23 @@ impl ServiceClientBuilder {
     /// The [`bearer_token`](Self::bearer_token) and
     /// [`default_header`](Self::default_header) values still apply: they are sent
     /// per-request rather than baked into the client, so they work identically
-    /// whether or not a client is supplied. Only [`timeout`](Self::timeout) is
-    /// ignored with a supplied client — configure the timeout on the client you
-    /// pass in, or use [`attempt_timeout`](Self::attempt_timeout).
+    /// whether or not a client is supplied.
     ///
-    /// # Deadlines replace the supplied client's timeout
+    /// # The builder's timeout replaces the supplied client's
     ///
-    /// Under a deadline ([`RetryPolicy::deadline`] or
-    /// [`RequestBuilder::deadline_at`](crate::RequestBuilder::deadline_at)), the
-    /// supplied client's own timeout is **replaced** on every attempt by the
-    /// remaining budget. This crate cannot read that timeout, and reqwest
-    /// applies one timeout per request, so a 5s client timeout under a 60s
-    /// deadline lets a single attempt run for up to 60s. To keep a tighter
-    /// per-attempt bound, set [`attempt_timeout`](Self::attempt_timeout) here
-    /// (or [`RequestBuilder::timeout`](crate::RequestBuilder::timeout) on one
-    /// request).
+    /// The builder's [`timeout`](Self::timeout) (30s unless changed) bounds
+    /// every attempt on the supplied client too: it is sent as each request's
+    /// reqwest timeout, which replaces the client's own. This crate cannot
+    /// read a supplied client's timeout, so it never relies on one being set:
+    /// a client with none can no longer hang a request forever. To bound
+    /// attempts differently, set [`timeout`](Self::timeout) or
+    /// [`attempt_timeout`](Self::attempt_timeout) here (or
+    /// [`RequestBuilder::timeout`](crate::RequestBuilder::timeout) on one
+    /// request). To keep the supplied client's own timeout instead, opt out
+    /// with [`no_timeout`](Self::no_timeout); under a deadline
+    /// ([`RetryPolicy::deadline`] or
+    /// [`RequestBuilder::deadline_at`](crate::RequestBuilder::deadline_at))
+    /// the time remaining still replaces it on every attempt.
     ///
     /// # With an endpoint set
     ///
@@ -600,8 +648,9 @@ impl ServiceClientBuilder {
     /// Returns [`ClientError::Config`] if the base URL is not a valid absolute
     /// `http`/`https` URL, or if the bearer token cannot be encoded as a header
     /// value, or if the underlying HTTP client cannot be constructed. A client
-    /// supplied via [`with_http_client`](Self::with_http_client) is used as-is,
-    /// so the last case cannot arise on that path.
+    /// supplied via [`with_http_client`](Self::with_http_client) is used as-is
+    /// (only its requests carry the builder's timeout), so the last case cannot
+    /// arise on that path.
     ///
     /// Returns [`ClientError::InvalidEndpoints`] if a
     /// [`failover_endpoint`](Self::failover_endpoint) is not a bare origin,
@@ -642,13 +691,13 @@ impl ServiceClientBuilder {
         let failover_urls: Vec<&str> = self.failovers.iter().map(Endpoint::url).collect();
         let origins = validate_set(primary, &failover_urls)?;
 
+        // The timeout is not baked into a built client: it is sent with every
+        // attempt (see `attempt_timeout`), the one mechanism that also binds a
+        // supplied client.
         let shared = match self.http_client {
-            Some(client) => Slot {
-                http: client,
-                timeout: None,
-            },
+            Some(client) => Slot { http: client },
             None => {
-                let mut builder = reqwest::Client::builder().timeout(self.timeout);
+                let mut builder = reqwest::Client::builder();
                 if origins.len() > 1 {
                     builder = builder.redirect(in_set_redirects(origins.clone()));
                 }
@@ -656,21 +705,13 @@ impl ServiceClientBuilder {
                     http: builder.build().map_err(|e| {
                         ClientError::Config(format!("failed to build HTTP client: {e}"))
                     })?,
-                    timeout: Some(self.timeout),
                 }
             }
         };
         let mut slots = Vec::with_capacity(origins.len());
         for endpoint in self.failovers {
-            slots.push(match endpoint.http {
-                Some(http) => Slot {
-                    http,
-                    timeout: None,
-                },
-                None => Slot {
-                    http: shared.http.clone(),
-                    timeout: shared.timeout,
-                },
+            slots.push(Slot {
+                http: endpoint.http.unwrap_or_else(|| shared.http.clone()),
             });
         }
         slots.insert(0, shared);
@@ -686,6 +727,7 @@ impl ServiceClientBuilder {
                 version: self.version,
                 retry: self.retry,
                 attempt_timeout: self.attempt_timeout,
+                timeout: self.timeout,
                 default_headers: self.default_headers,
             }),
         })
@@ -751,7 +793,7 @@ mod tests {
         assert_eq!(client.api_version(), ApiVersion::V1);
         assert_eq!(client.inner.base_path, "/api");
         assert!(client.inner.retry.is_none());
-        assert_eq!(client.inner.slots[0].timeout, Some(Duration::from_secs(30)));
+        assert_eq!(client.inner.timeout, Some(Duration::from_secs(30)));
         assert_eq!(client.endpoints().len(), 1);
         assert_eq!(client.inner.attempt_timeout, None);
     }
@@ -793,7 +835,23 @@ mod tests {
             .build()
             .unwrap();
         assert_eq!(supplied.inner.attempt_timeout, Some(Duration::from_secs(2)));
-        assert_eq!(supplied.inner.slots[0].timeout, None);
+        assert_eq!(supplied.inner.timeout, Some(DEFAULT_TIMEOUT));
+    }
+
+    #[test]
+    fn no_timeout_is_explicit_and_a_later_timeout_restores_one() {
+        let none = ServiceClient::builder("https://api.example.com")
+            .with_http_client(reqwest::Client::new())
+            .no_timeout()
+            .build()
+            .unwrap();
+        assert_eq!(none.inner.timeout, None);
+        let again = ServiceClient::builder("https://api.example.com")
+            .no_timeout()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+        assert_eq!(again.inner.timeout, Some(Duration::from_secs(5)));
     }
 
     #[test]
@@ -804,8 +862,8 @@ mod tests {
             .with_http_client(supplied)
             .build()
             .unwrap();
-        // A supplied client's timeout cannot be observed.
-        assert_eq!(client.inner.slots[0].timeout, None);
+        // The builder's default timeout binds a supplied client too.
+        assert_eq!(client.inner.timeout, Some(DEFAULT_TIMEOUT));
         assert_eq!(client.inner.attempt_timeout, None);
         // The bearer token is carried per-request, not baked into the supplied
         // client, so it survives on the custom-client path.
@@ -827,9 +885,9 @@ mod tests {
             )
             .build()
             .unwrap();
-        let timeouts: Vec<_> = client.inner.slots.iter().map(|s| s.timeout).collect();
-        let seven = Some(Duration::from_secs(7));
-        assert_eq!(timeouts, [seven, seven, None]);
+        assert_eq!(client.inner.slots.len(), 3);
+        // One timeout for every endpoint, the one with its own client included.
+        assert_eq!(client.inner.timeout, Some(Duration::from_secs(7)));
         assert_eq!(client.preferred_endpoint(), &client.endpoints()[0]);
     }
 

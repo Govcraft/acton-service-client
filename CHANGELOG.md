@@ -5,6 +5,29 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **The builder's timeout now bounds a supplied HTTP client**
+  ([#6](https://github.com/Govcraft/acton-service-client/issues/6)). With a
+  client passed to `ServiceClientBuilder::with_http_client` or
+  `Endpoint::with_http_client`, 0.2.0 and 0.2.1 ignored `.timeout()`, and
+  without a deadline a request went out with no timeout at all: on a client
+  built without one, a stalled server hung the call forever, and the
+  documented 30s default did not apply. The builder's timeout (30s unless
+  changed) is now sent as every attempt's reqwest timeout on every path, so
+  it replaces a supplied client's own timeout. A built client no longer has
+  the timeout baked in; it gets the same per-request bound, so nothing
+  changes for it. If you relied on a supplied client's own timeout, set that
+  value with `.timeout()`, or opt out with `.no_timeout()`.
+
+### Added
+
+- `ServiceClientBuilder::no_timeout()`: the explicit opt-out from the builder's
+  timeout. A built client then has none, and a supplied client keeps its own.
+  `attempt_timeout`, a per-request `.timeout()`, and a deadline still apply.
+
 ## [0.2.1] - Unreleased
 
 ### Added
