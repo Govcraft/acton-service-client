@@ -66,6 +66,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the request on the success path too. No existing signature changes.
 - `spec/fixtures/endpoint-failover-v1.json`: the cross-language fixture for the
   failover rules, run on a virtual clock and over real HTTP.
+- **TLS material on the builder.** `ServiceClientBuilder::root_certificate_pem`
+  trusts a private CA (a PEM bundle, repeatable) in addition to the system
+  roots, and `ServiceClientBuilder::identity_pem(cert, key)` presents a client
+  certificate for mutual TLS. Both apply to the client the builder constructs,
+  so `.timeout()` still bounds it: a caller no longer has to build its own
+  `reqwest::Client` (and so lose the builder's timeout) just to talk to a
+  private-CA or mTLS service. Endpoints without their own client share it.
+  Unusable material is a `ClientError::Config` from `build()` that never
+  echoes the PEM, and TLS material alongside `with_http_client` is refused at
+  `build()` rather than silently ignored.
 
 ### Changed
 
