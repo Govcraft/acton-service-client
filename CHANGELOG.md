@@ -76,6 +76,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Unusable material is a `ClientError::Config` from `build()` that never
   echoes the PEM, and TLS material alongside `with_http_client` is refused at
   `build()` rather than silently ignored.
+- **Sensitive per-request headers.** `RequestBuilder::sensitive_header(name,
+  value)` and `RequestBuilder::bearer_token(token)` set a header on one request
+  with its value marked sensitive, as `ServiceClientBuilder::bearer_token`
+  already does for the client: it prints as `Sensitive` in `Debug` output and
+  HTTP/2 never HPACK-indexes it. A token obtained at run time (an OAuth access
+  token) previously had to go through `header`, which marks nothing. A
+  per-request bearer token replaces a client-level one for that request.
 
 ### Changed
 

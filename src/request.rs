@@ -110,6 +110,67 @@ impl RequestBuilder {
         Ok(self)
     }
 
+    /// Add a request header whose value is a secret.
+    ///
+    /// Like [`header`](Self::header), but the value is marked sensitive: it
+    /// prints as `Sensitive` in `Debug` output (including the request's
+    /// effective headers and any error that carries them) and HTTP/2 never
+    /// adds it to the HPACK dynamic table. Use it for any per-request
+    /// credential, such as an API key header or a token obtained at run time.
+    ///
+    /// ```
+    /// # use acton_service_client::{Method, ServiceClient};
+    /// # fn demo(client: &ServiceClient, key: &str) -> Result<(), acton_service_client::ClientError> {
+    /// let request = client
+    ///     .request(Method::GET, "reports")
+    ///     .sensitive_header("x-api-key", key)?;
+    /// # let _ = request; Ok(()) }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError::Config`] if `name` or `value` is not a valid HTTP
+    /// header. The message never contains the value.
+    pub fn sensitive_header(
+        mut self,
+        name: impl AsRef<str>,
+        value: impl AsRef<str>,
+    ) -> Result<Self, ClientError> {
+        let name = HeaderName::from_bytes(name.as_ref().as_bytes())
+            .map_err(|e| ClientError::Config(format!("invalid header name: {e}")))?;
+        let mut value = HeaderValue::from_str(value.as_ref()).map_err(|_| {
+            ClientError::Config(format!(
+                "the value of header {name} is not a valid header value"
+            ))
+        })?;
+        value.set_sensitive(true);
+        self.headers.insert(name, value);
+        Ok(self)
+    }
+
+    /// Send `Authorization: Bearer <token>` on this request only, marked
+    /// sensitive.
+    ///
+    /// The per-request counterpart of
+    /// [`ServiceClientBuilder::bearer_token`](crate::ServiceClientBuilder::bearer_token),
+    /// for a token that is obtained or refreshed at run time (an OAuth access
+    /// token, for example) and so cannot be fixed when the client is built. It
+    /// replaces a client-level bearer token for this request. Like the
+    /// client-level token, the value prints as `Sensitive` in `Debug` output
+    /// and is never HPACK-indexed; setting the header by hand with
+    /// [`header`](Self::header) would lose both.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError::Config`] if the token is not a valid header
+    /// value. The message never contains the token.
+    pub fn bearer_token(self, token: impl AsRef<str>) -> Result<Self, ClientError> {
+        self.sensitive_header(
+            reqwest::header::AUTHORIZATION,
+            format!("Bearer {}", token.as_ref()),
+        )
+    }
+
     /// Attach a full propagation [`RequestContext`] to this request.
     #[must_use]
     pub fn context(mut self, context: RequestContext) -> Self {
@@ -733,6 +794,74 @@ mod tests {
             .unwrap()
             .effective_headers();
         assert_eq!(h.get("authorization").unwrap(), "Bearer explicit");
+    }
+
+    #[test]
+    fn a_per_request_bearer_token_is_sensitive_and_redacted_from_debug() {
+        let c = ServiceClient::builder("https://api.example.com")
+            .bearer_token("from-default")
+            .build()
+            .unwrap();
+        let h = c
+            .request(Method::GET, "x")
+            .bearer_token("run-time-token")
+            .unwrap()
+            .effective_headers();
+        let auth = h.get("authorization").unwrap();
+        assert_eq!(auth, "Bearer run-time-token", "it replaces the default");
+        assert!(auth.is_sensitive());
+        let debug = format!("{h:?}");
+        assert!(!debug.contains("run-time-token"), "{debug}");
+        assert!(debug.contains("Sensitive"), "{debug}");
+    }
+
+    #[test]
+    fn a_sensitive_header_is_marked_and_redacted_from_debug() {
+        let h = client()
+            .request(Method::GET, "x")
+            .sensitive_header("x-api-key", "k-123")
+            .unwrap()
+            .effective_headers();
+        let key = h.get("x-api-key").unwrap();
+        assert_eq!(key, "k-123");
+        assert!(key.is_sensitive());
+        assert!(!format!("{h:?}").contains("k-123"));
+    }
+
+    #[test]
+    fn an_invalid_sensitive_value_is_refused_without_echoing_it() {
+        let error = client()
+            .request(Method::GET, "x")
+            .bearer_token("line\nbreak-secret")
+            .err()
+            .expect("a newline is not a header value");
+        let ClientError::Config(message) = &error else {
+            panic!("a config error: {error:?}");
+        };
+        assert!(!message.contains("break-secret"), "{message}");
+    }
+
+    #[test]
+    fn a_sensitive_default_header_stays_sensitive_on_every_request() {
+        let mut value = HeaderValue::from_static("static-key");
+        value.set_sensitive(true);
+        let c = ServiceClient::builder("https://api.example.com")
+            .default_header(HeaderName::from_static("x-api-key"), value)
+            .build()
+            .unwrap();
+        let h = c.request(Method::GET, "x").effective_headers();
+        assert!(h.get("x-api-key").unwrap().is_sensitive());
+        assert!(!format!("{h:?}").contains("static-key"));
+    }
+
+    #[test]
+    fn a_plain_header_is_not_marked_sensitive() {
+        let h = client()
+            .request(Method::GET, "x")
+            .header("x-trace", "visible")
+            .unwrap()
+            .effective_headers();
+        assert!(!h.get("x-trace").unwrap().is_sensitive());
     }
 
     #[test]
