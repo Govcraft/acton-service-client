@@ -1,5 +1,6 @@
 //! Per-request builder and the retry/execute loop.
 
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use reqwest::header::{CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue};
@@ -10,7 +11,7 @@ use serde::de::DeserializeOwned;
 use crate::client::{ServiceClient, redirect_verdict};
 use crate::context::RequestContext;
 use crate::error::{ClientError, build_api_error, parse_retry_after, snippet};
-use crate::failover::{Failover, Next, Outcome, Resend, Stop};
+use crate::failover::{Failover, Next, Outcome, Resend, RetryObserver, Stop};
 use crate::retry::{attempt_timeout, is_idempotent, remaining_until};
 use crate::url::{build_url, join_segments};
 
@@ -55,6 +56,7 @@ pub struct RequestBuilder {
     retry_on: Vec<StatusCode>,
     timeout: Option<Duration>,
     deadline_at: Option<Instant>,
+    observer: Option<Arc<dyn RetryObserver>>,
 }
 
 impl RequestBuilder {
@@ -78,6 +80,7 @@ impl RequestBuilder {
             retry_on: Vec::new(),
             timeout: None,
             deadline_at: None,
+            observer: None,
         }
     }
 
@@ -120,6 +123,64 @@ impl RequestBuilder {
     #[must_use]
     pub fn retriable(mut self, retriable: bool) -> Self {
         self.retriable_override = retriable;
+        self
+    }
+
+    /// Be notified of this request's re-sends, and only this request's, in
+    /// addition to the client's observer
+    /// ([`ServiceClientBuilder::retry_observer`](crate::ServiceClientBuilder::retry_observer)).
+    ///
+    /// A client is shared by concurrent calls, so its observer hears the
+    /// re-sends of every call interleaved, with nothing to tell them apart:
+    /// use it for metrics. A request's observer hears exactly that request's
+    /// re-sends, in send order, which makes it a complete per-attempt record
+    /// of the call (see [`RetryObserver`]'s guarantees): every attempt but the
+    /// last is reported once, and the last is what the call returns. For each
+    /// re-send the client's observer is called first, then the request's.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use acton_service_client::{
+    ///     EndpointOrigin, Method, RetryObserver, RetryReason, ServiceClient, StatusCode,
+    /// };
+    /// use std::sync::{Arc, Mutex};
+    ///
+    /// /// Every reason this call met before its last attempt.
+    /// #[derive(Clone, Default)]
+    /// struct Reasons(Arc<Mutex<Vec<RetryReason>>>);
+    ///
+    /// impl RetryObserver for Reasons {
+    ///     fn on_rotation(&self, _left: &EndpointOrigin, reason: RetryReason) {
+    ///         self.0.lock().unwrap().push(reason);
+    ///     }
+    ///
+    ///     fn on_retry(&self, _endpoint: &EndpointOrigin, reason: RetryReason, _attempt: u32) {
+    ///         self.0.lock().unwrap().push(reason);
+    ///     }
+    /// }
+    ///
+    /// # async fn run(client: ServiceClient) {
+    /// let reasons = Reasons::default();
+    /// let result = client
+    ///     .request(Method::POST, "authorize")
+    ///     .retriable(true)
+    ///     .retry_on_status(StatusCode::MISDIRECTED_REQUEST)
+    ///     .retry_observer(reasons.clone())
+    ///     .send()
+    ///     .await;
+    /// let earlier_unprocessed = reasons
+    ///     .0
+    ///     .lock()
+    ///     .unwrap()
+    ///     .iter()
+    ///     .all(RetryReason::proves_not_processed);
+    /// # let _ = (result, earlier_unprocessed);
+    /// # }
+    /// ```
+    #[must_use]
+    pub fn retry_observer(mut self, observer: impl RetryObserver) -> Self {
+        self.observer = Some(Arc::new(observer));
         self
     }
 
@@ -444,13 +505,19 @@ impl RequestBuilder {
                 Ok(attempt) => attempt,
                 Err(stop) => return self.finish(stop, &failover, last, started),
             };
-            if let (Some(resend), Some(observer)) = (attempt.resend, &inner.observer) {
-                match resend {
-                    Resend::Rotation { from, reason } => {
-                        observer.on_rotation(&inner.origins[from], reason);
-                    }
-                    Resend::Retry { reason } => {
-                        observer.on_retry(&inner.origins[attempt.endpoint], reason, attempt.number);
+            if let Some(resend) = attempt.resend {
+                for observer in [&inner.observer, &self.observer].into_iter().flatten() {
+                    match resend {
+                        Resend::Rotation { from, reason } => {
+                            observer.on_rotation(&inner.origins[from], reason);
+                        }
+                        Resend::Retry { reason } => {
+                            observer.on_retry(
+                                &inner.origins[attempt.endpoint],
+                                reason,
+                                attempt.number,
+                            );
+                        }
                     }
                 }
             }

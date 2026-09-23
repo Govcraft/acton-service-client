@@ -381,27 +381,51 @@ impl fmt::Display for RetryReason {
 /// endpoint therefore only ever calls [`on_retry`](Self::on_retry). Both run
 /// inside the send loop, so keep them cheap and non-blocking.
 ///
+/// # Two places to install one
+///
+/// - **On the client**
+///   ([`ServiceClientBuilder::retry_observer`](crate::ServiceClientBuilder::retry_observer)):
+///   it hears the re-sends of every call made through the client. Calls run
+///   concurrently on a shared client, so their reports interleave and carry
+///   nothing that tells one call from another: use it for metrics. It hears
+///   the union of every call's reports, with no ordering promise across
+///   calls.
+/// - **On a request**
+///   ([`RequestBuilder::retry_observer`](crate::RequestBuilder::retry_observer)):
+///   it hears exactly that request's re-sends and no other's, whatever runs
+///   concurrently. Use it to reason about one call, for example to prove
+///   that no endpoint processed it.
+///
+/// Both are called for each re-send, the client's first.
+///
 /// # Guarantees
 ///
-/// These hold for every call, on a single endpoint or a set, whatever it
+/// These hold for every request, on a single endpoint or a set, whatever it
 /// returns, and `spec/fixtures/endpoint-failover-v1.json` pins them:
 ///
-/// - **One call per attempt but the last, in send order.** Every attempt the
-///   call sends except the last is reported exactly once, by
-///   [`on_rotation`](Self::on_rotation) or [`on_retry`](Self::on_retry), with
-///   that attempt's endpoint and outcome. The last attempt is never reported:
-///   its outcome is what the call returns (the response, or the error).
+/// - **A request's observer is a complete per-attempt record of that
+///   request.** Every attempt the request sends except the last is reported
+///   to it exactly once, in send order, by [`on_rotation`](Self::on_rotation)
+///   or [`on_retry`](Self::on_retry), with that attempt's endpoint and
+///   outcome. The last attempt is never reported: its outcome is what the
+///   call returns (the response, or the error). Concurrent requests on the
+///   same client never reach it.
+/// - **The client's observer hears the union.** Every report made to any
+///   request's observer is made to the client's too (and a request without
+///   its own observer is reported the same way), so counts by method and
+///   reason add up across calls. Within one call the order holds; across
+///   calls it does not.
 /// - **Synchronous, on the caller's task.** Both run inside the future that
 ///   `send` returns, on the task that awaits it; the crate spawns no task for
-///   them. A `tokio::task_local!` scoped around the call therefore sees every
-///   report for that call and no other.
+///   them.
 ///
-/// So the complete per-attempt record of a call is its reports followed by
-/// its result, on the success path too. For example, a call that meets a
-/// `421`, then a connect failure, then returns an accepted `421` response
-/// reports two reasons (`421`, `connect`) and returns the third outcome; since
-/// all three [prove it](RetryReason::proves_not_processed), no endpoint
-/// processed the request.
+/// So the complete per-attempt record of a request is its own observer's
+/// reports followed by its result, on the success path too. For example, a
+/// request that meets a `421`, then a connect failure, then returns an
+/// accepted `421` response reports two reasons (`421`, `connect`) and returns
+/// the third outcome; since all three
+/// [prove it](RetryReason::proves_not_processed), no endpoint processed the
+/// request.
 ///
 /// # Recommended wiring for an `acton-service` application
 ///
@@ -411,9 +435,16 @@ impl fmt::Display for RetryReason {
 /// same one). A single-endpoint deployment answering `421` shows up in the
 /// second.
 ///
-/// ```ignore
+/// ```no_run
+/// # // Stands in for acton-service's accessor, which returns the service's
+/// # // opentelemetry Meter.
+/// # mod acton_service { pub mod observability {
+/// #     pub fn get_meter() -> opentelemetry::metrics::Meter {
+/// #         opentelemetry::global::meter("acton-service")
+/// #     }
+/// # } }
 /// use acton_service::observability::get_meter;
-/// use acton_service_client::{EndpointOrigin, RetryObserver, RetryReason};
+/// use acton_service_client::{EndpointOrigin, RetryObserver, RetryReason, ServiceClient};
 /// use opentelemetry::KeyValue;
 /// use opentelemetry::metrics::Counter;
 ///
@@ -442,6 +473,7 @@ impl fmt::Display for RetryReason {
 ///         retries: meter.u64_counter("acton_service_client.endpoint.retries").build(),
 ///     })
 ///     .build()?;
+/// # Ok::<(), acton_service_client::ClientError>(())
 /// ```
 ///
 /// # Examples
@@ -1643,6 +1675,20 @@ mod tests {
             .map(|i| origin(&format!("https://e{i}.example")))
             .collect();
         for scenario in &fixture.scenarios {
+            if scenario.concurrent {
+                // Each call's path must not depend on the interleaving, so the
+                // calls run one after another here: all start and end on the
+                // same preferred endpoint.
+                let start = scenario.calls[0].preferred_before;
+                assert!(
+                    scenario
+                        .calls
+                        .iter()
+                        .all(|c| c.preferred_before == start && c.preferred_after == start),
+                    "{}: a concurrent scenario must keep the preference still",
+                    scenario.name
+                );
+            }
             let policy = scenario.policy.as_ref().map(fixture::Policy::to_policy);
             let method = reqwest::Method::from_bytes(scenario.request.method.as_bytes()).unwrap();
             let allowed = is_idempotent(&method) || scenario.request.retriable;

@@ -5,7 +5,7 @@
     "units": "Durations are whole milliseconds (_ms) or whole seconds (_s, Retry-After only).",
     "reason_shape": "A rotation reason / attempt outcome is {\"kind\":\"status\",\"status\":N} | {\"kind\":\"connect\"} | {\"kind\":\"timeout\"}.",
     "validation": "Endpoint 0 is the base URL; failover endpoints are numbered from 1. Each failover endpoint is checked in order: a bare http(s) origin (not_an_origin), then the base URL's scheme (mixed_scheme), then a new origin once normalized (duplicate_origin). The first failure is the error. Origins display as scheme://host:port with the default port filled in.",
-    "scenarios": "Each scenario is a sequence of calls on one client, sharing its sticky preference. Each call lists every attempt in send order: the endpoint the client must choose, the scripted result, the time it takes (latency_ms, default 1; a stall takes the attempt timeout), and, for every attempt but a call's last, when the next attempt goes out ('now', or 'after' a pause). A virtual clock starts at 0 for each call; time advances only by attempt time and pauses. 'draws' (jitter 'full' scenarios only) feed the jitter draw, one per computed (non Retry-After) pause, in order; with jitter 'none' the draw is unused and no draws are listed. 'observed' is every call of the retry observer, in order: a rotation (the endpoint left and the reason) or a retry (the endpoint re-sent to, the reason, and the number of the attempt about to be sent, counted over the call). A 'reset' result is a transport failure after the request was written (a connection reset mid-body): neither connect nor timeout, so it is returned as it is ('reset' outcome) and never retried. 'outcome' is the call's result; for endpoints_exhausted, 'attempts' is the full trace and 'last' the final attempt's own error. For ok, 'attempts' is the trace the returned response carries: every attempt whose outcome asked for another try (a rotation or a retry), in send order, so empty when the first attempt answered, and ending with the returned response itself when the budget ran out on an accepted status that asks for another try. An endpoint whose results are 'connect' is refused on every attempt.",
+    "scenarios": "Each scenario is a sequence of calls on one client, sharing its sticky preference; a scenario marked 'concurrent' sends all its calls at once instead, and is built so that each call's path does not depend on the interleaving. Each call lists every attempt in send order: the endpoint the client must choose, the scripted result, the time it takes (latency_ms, default 1; a stall takes the attempt timeout), and, for every attempt but a call's last, when the next attempt goes out ('now', or 'after' a pause). A virtual clock starts at 0 for each call; time advances only by attempt time and pauses. 'draws' (jitter 'full' scenarios only) feed the jitter draw, one per computed (non Retry-After) pause, in order; with jitter 'none' the draw is unused and no draws are listed. 'observed' is every call of the retry observer, in order: a rotation (the endpoint left and the reason) or a retry (the endpoint re-sent to, the reason, and the number of the attempt about to be sent, counted over the call). A 'reset' result is a transport failure after the request was written (a connection reset mid-body): neither connect nor timeout, so it is returned as it is ('reset' outcome) and never retried. 'outcome' is the call's result; for endpoints_exhausted, 'attempts' is the full trace and 'last' the final attempt's own error. For ok, 'attempts' is the trace the returned response carries: every attempt whose outcome asked for another try (a rotation or a retry), in send order, so empty when the first attempt answered, and ending with the returned response itself when the budget ran out on an accepted status that asks for another try. An endpoint whose results are 'connect' is refused on every attempt.",
     "decision_rules": [
       "Rotation outcomes: a status in retry_on_status (checked before accept_status), a connect failure, an attempt timeout. Other statuses retriable by default (429, 502, 503, 504; 423 only with Retry-After) and not accepted retry the SAME endpoint. Everything else ends the call.",
       "Nothing is retried unless a policy is set and the method is idempotent (GET, HEAD, DELETE, PUT) or the request is marked retriable.",
@@ -15,7 +15,7 @@
       "Budget spent (max_attempts, deadline, or refused pause): if at least one rotation was made (an attempt was actually sent to the next endpoint), endpoints_exhausted with the trace, unless the last outcome was an accepted status, which is returned as a success; otherwise the last outcome as it is.",
       "Sticky preference: any response whose status is not a rotation status for the request moves it to that endpoint; transport failures and rotation statuses never do. The next call starts there.",
       "The retry observer fires when a re-send is actually sent: a rotation when it goes to the next endpoint (with the endpoint left and the reason), a retry when it goes to the same endpoint (with that endpoint, the reason, and the attempt number). A single endpoint never rotates: every rotation outcome retries in place, exactly as 0.2.0, and is observed as a retry.",
-      "Completeness: 'observed' has exactly one entry for every attempt but the last, in send order, with that attempt's endpoint ('left' for a rotation, 'endpoint' for a retry) and outcome as its reason; a retry's attempt number is the index of the attempt it re-sends plus two. The last attempt is never observed: its outcome is the call's outcome. Observer calls run synchronously on the caller's task."
+      "Completeness: 'observed' has exactly one entry for every attempt but the last, in send order, with that attempt's endpoint ('left' for a rotation, 'endpoint' for a retry) and outcome as its reason; a retry's attempt number is the index of the attempt it re-sends plus two. The last attempt is never observed: its outcome is the call's outcome. Observer calls run synchronously on the caller's task. 'observed' is what the request's own observer hears; the client's observer hears the same reports, and, when calls run concurrently, the union of every call's reports with no order across calls."
     ]
   },
   "reasons": [
@@ -552,6 +552,88 @@
               { "endpoint": 0, "outcome": { "kind": "status", "status": 421 }, "rotated": true },
               { "endpoint": 1, "outcome": { "kind": "connect" }, "rotated": true },
               { "endpoint": 2, "outcome": { "kind": "status", "status": 421 }, "rotated": false }
+            ]
+          },
+          "preferred_after": 0
+        }
+      ]
+    },
+    {
+      "name": "concurrent_calls_each_hear_only_their_own_resends",
+      "about": "The four calls run at once on one client. A request's own observer hears exactly its own re-sends, in order; the client's observer hears the union of all four. Every call ends with a definitive answer from endpoint 0, so the sticky preference stays there whatever the interleaving, and each call's path is fixed.",
+      "endpoints": 2,
+      "concurrent": true,
+      "policy": { "max_attempts": 6, "base_delay_ms": 10, "max_delay_ms": 160, "jitter": "none", "deadline_ms": 15000 },
+      "request": { "method": "POST", "retriable": true, "retry_on_status": [421] },
+      "calls": [
+        {
+          "preferred_before": 0,
+          "attempts": [
+            { "endpoint": 0, "result": { "kind": "status", "status": 200 } }
+          ],
+          "observed": [],
+          "outcome": { "kind": "ok", "status": 200, "attempts": [] },
+          "preferred_after": 0
+        },
+        {
+          "preferred_before": 0,
+          "attempts": [
+            { "endpoint": 0, "result": { "kind": "status", "status": 503 }, "next": { "kind": "after", "pause_ms": 10 } },
+            { "endpoint": 0, "result": { "kind": "status", "status": 200 } }
+          ],
+          "observed": [
+            { "kind": "retry", "endpoint": 0, "reason": { "kind": "status", "status": 503 }, "attempt": 2 }
+          ],
+          "outcome": {
+            "kind": "ok",
+            "status": 200,
+            "attempts": [
+              { "endpoint": 0, "outcome": { "kind": "status", "status": 503 }, "rotated": false }
+            ]
+          },
+          "preferred_after": 0
+        },
+        {
+          "preferred_before": 0,
+          "attempts": [
+            { "endpoint": 0, "result": { "kind": "status", "status": 421 }, "next": { "kind": "now" } },
+            { "endpoint": 1, "result": { "kind": "status", "status": 421 }, "next": { "kind": "after", "pause_ms": 10 } },
+            { "endpoint": 0, "result": { "kind": "status", "status": 200 } }
+          ],
+          "observed": [
+            { "kind": "rotation", "left": 0, "reason": { "kind": "status", "status": 421 } },
+            { "kind": "rotation", "left": 1, "reason": { "kind": "status", "status": 421 } }
+          ],
+          "outcome": {
+            "kind": "ok",
+            "status": 200,
+            "attempts": [
+              { "endpoint": 0, "outcome": { "kind": "status", "status": 421 }, "rotated": true },
+              { "endpoint": 1, "outcome": { "kind": "status", "status": 421 }, "rotated": true }
+            ]
+          },
+          "preferred_after": 0
+        },
+        {
+          "preferred_before": 0,
+          "attempts": [
+            { "endpoint": 0, "result": { "kind": "status", "status": 503 }, "next": { "kind": "after", "pause_ms": 10 } },
+            { "endpoint": 0, "result": { "kind": "status", "status": 421 }, "next": { "kind": "now" } },
+            { "endpoint": 1, "result": { "kind": "status", "status": 421 }, "next": { "kind": "after", "pause_ms": 20 } },
+            { "endpoint": 0, "result": { "kind": "status", "status": 200 } }
+          ],
+          "observed": [
+            { "kind": "retry", "endpoint": 0, "reason": { "kind": "status", "status": 503 }, "attempt": 2 },
+            { "kind": "rotation", "left": 0, "reason": { "kind": "status", "status": 421 } },
+            { "kind": "rotation", "left": 1, "reason": { "kind": "status", "status": 421 } }
+          ],
+          "outcome": {
+            "kind": "ok",
+            "status": 200,
+            "attempts": [
+              { "endpoint": 0, "outcome": { "kind": "status", "status": 503 }, "rotated": false },
+              { "endpoint": 0, "outcome": { "kind": "status", "status": 421 }, "rotated": true },
+              { "endpoint": 1, "outcome": { "kind": "status", "status": 421 }, "rotated": true }
             ]
           },
           "preferred_after": 0

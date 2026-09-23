@@ -69,6 +69,9 @@ pub enum SetError {
 pub struct Scenario {
     pub name: String,
     pub endpoints: usize,
+    /// All calls are sent at once rather than one after another.
+    #[serde(default)]
+    pub concurrent: bool,
     #[serde(default)]
     pub attempt_timeout_ms: Option<u64>,
     pub policy: Option<Policy>,
@@ -85,7 +88,7 @@ pub struct Policy {
     pub deadline_ms: Option<u64>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 pub struct Request {
     pub method: String,
     #[serde(default)]

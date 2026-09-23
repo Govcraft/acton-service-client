@@ -7,7 +7,7 @@ mod fixture;
 #[path = "support/refused.rs"]
 mod refused;
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -19,21 +19,44 @@ use axum::http::{HeaderMap, HeaderValue, StatusCode as AxumStatus};
 use axum::response::{IntoResponse, Redirect};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-type Log = Arc<Mutex<Vec<usize>>>;
+/// Every request that reached a server, as `(call, endpoint)`: the call is
+/// the request's `x-fixture-call` header (`0` without one).
+type Log = Arc<Mutex<Vec<(usize, usize)>>>;
 
-/// Serve `script` in order on a fresh port, logging each arrival as `index`.
-async fn scripted_endpoint(
-    index: usize,
-    script: Vec<(fixture::ScriptedResult, u64)>,
-    log: Log,
-) -> String {
-    let queue = Arc::new(Mutex::new(VecDeque::from(script)));
-    let app = axum::Router::new().fallback(move || {
-        let queue = queue.clone();
+/// Each call's scripted results on one endpoint, keyed by call.
+type Scripts = HashMap<usize, VecDeque<(fixture::ScriptedResult, u64)>>;
+
+/// The fixture call a request belongs to.
+const CALL_HEADER: &str = "x-fixture-call";
+
+fn call_of(headers: &HeaderMap) -> usize {
+    headers
+        .get(CALL_HEADER)
+        .and_then(|v| v.to_str().ok()?.parse().ok())
+        .unwrap_or(0)
+}
+
+/// One call's script, for a server a single call uses.
+fn one_call(script: Vec<(fixture::ScriptedResult, u64)>) -> Scripts {
+    HashMap::from([(0, VecDeque::from(script))])
+}
+
+/// Serve each call's script in order on a fresh port, logging every
+/// arrival. Calls are told apart by their `x-fixture-call` header, so
+/// concurrent calls each meet their own script.
+async fn scripted_endpoint(index: usize, scripts: Scripts, log: Log) -> String {
+    let scripts = Arc::new(Mutex::new(scripts));
+    let app = axum::Router::new().fallback(move |headers: HeaderMap| {
+        let scripts = scripts.clone();
         let log = log.clone();
         async move {
-            log.lock().unwrap().push(index);
-            let next = queue.lock().unwrap().pop_front();
+            let call = call_of(&headers);
+            log.lock().unwrap().push((call, index));
+            let next = scripts
+                .lock()
+                .unwrap()
+                .get_mut(&call)
+                .and_then(VecDeque::pop_front);
             match next {
                 Some((
                     fixture::ScriptedResult::Status {
@@ -92,7 +115,13 @@ async fn resetting_endpoint(index: usize, at: Break, log: Log) -> String {
                         Ok(n) => head.extend_from_slice(&buf[..n]),
                     }
                 }
-                log.lock().unwrap().push(index);
+                let head = String::from_utf8_lossy(&head).to_ascii_lowercase();
+                let call = head
+                    .lines()
+                    .find_map(|line| line.strip_prefix(CALL_HEADER)?.strip_prefix(':'))
+                    .and_then(|value| value.trim().parse().ok())
+                    .unwrap_or(0);
+                log.lock().unwrap().push((call, index));
                 if let Break::MidResponseBody = at {
                     let partial = b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
                                     content-length: 1000\r\n\r\n{\"partial\":";
@@ -218,20 +247,125 @@ fn observed(
     }
 }
 
+fn fixture_observed(client: &ServiceClient, seen: Vec<Seen>) -> Vec<fixture::Observed> {
+    seen.into_iter()
+        .map(|seen| match seen {
+            Seen::Rotation(left, reason) => fixture::Observed::Rotation {
+                left: index_of(client, &left),
+                reason: fixture::Reason::from_label(reason.label()),
+            },
+            Seen::Retry(endpoint, reason, attempt) => fixture::Observed::Retry {
+                endpoint: index_of(client, &endpoint),
+                reason: fixture::Reason::from_label(reason.label()),
+                attempt,
+            },
+        })
+        .collect()
+}
+
+/// What one fixture call produced.
+struct CallRun {
+    result: Result<reqwest::Response, ClientError>,
+    /// What the request's own observer heard.
+    own: Vec<Seen>,
+    elapsed: Duration,
+}
+
+/// Send fixture call `n` with its own observer.
+async fn send_call(client: ServiceClient, request: Arc<fixture::Request>, n: usize) -> CallRun {
+    let own = Recorder::default();
+    let method = Method::from_bytes(request.method.as_bytes()).unwrap();
+    let mut builder = client
+        .request(method, "fixture")
+        .header(CALL_HEADER, n.to_string())
+        .unwrap()
+        .retriable(request.retriable)
+        .retry_observer(own.clone());
+    for &code in &request.retry_on_status {
+        builder = builder.retry_on_status(fixture::status(code));
+    }
+    for &code in &request.accept_status {
+        builder = builder.accept_status(fixture::status(code));
+    }
+    let started = Instant::now();
+    let result = builder.send().await;
+    CallRun {
+        result,
+        own: own.take(),
+        elapsed: started.elapsed(),
+    }
+}
+
+/// Check one call's run against the fixture; `arrivals` is every request
+/// that reached a server during the run.
+fn check_call(
+    client: &ServiceClient,
+    ctx: &str,
+    n: usize,
+    call: &fixture::Call,
+    run: CallRun,
+    arrivals: &[(usize, usize)],
+) {
+    assert_eq!(observed(client, run.result), call.outcome, "{ctx}");
+    let reached: Vec<usize> = call
+        .attempts
+        .iter()
+        .filter(|a| a.result != fixture::ScriptedResult::Connect)
+        .map(|a| a.endpoint)
+        .collect();
+    let arrived: Vec<usize> = arrivals
+        .iter()
+        .filter(|(c, _)| *c == n)
+        .map(|&(_, endpoint)| endpoint)
+        .collect();
+    assert_eq!(arrived, reached, "{ctx}: requests that reached a server");
+    assert_eq!(
+        fixture_observed(client, run.own),
+        call.observed,
+        "{ctx}: the request's own observer"
+    );
+    if call.draws.is_empty() {
+        let paused: u64 = call
+            .attempts
+            .iter()
+            .filter_map(|a| match a.next {
+                Some(fixture::NextStep::After { pause_ms }) => Some(pause_ms),
+                _ => None,
+            })
+            .sum();
+        assert!(
+            run.elapsed >= Duration::from_millis(paused),
+            "{ctx}: {:?} < {paused}ms of pauses",
+            run.elapsed
+        );
+    }
+}
+
+/// A multiset of reports, for comparing across calls with no order.
+fn tally(reports: impl IntoIterator<Item = fixture::Observed>) -> Vec<String> {
+    let mut all: Vec<String> = reports.into_iter().map(|r| format!("{r:?}")).collect();
+    all.sort();
+    all
+}
+
 async fn run_scenario(scenario: &fixture::Scenario) {
     let name = &scenario.name;
-    let mut scripts = vec![Vec::new(); scenario.endpoints];
-    for call in &scenario.calls {
+    let mut scripts: Vec<Scripts> = vec![HashMap::new(); scenario.endpoints];
+    for (n, call) in scenario.calls.iter().enumerate() {
         for attempt in &call.attempts {
-            scripts[attempt.endpoint].push((attempt.result, attempt.latency_ms));
+            scripts[attempt.endpoint]
+                .entry(n)
+                .or_default()
+                .push_back((attempt.result, attempt.latency_ms));
         }
     }
     let log: Log = Arc::default();
     let mut urls = Vec::new();
     let mut dead = Vec::new();
     for (index, script) in scripts.into_iter().enumerate() {
-        let count =
-            |kind: fixture::ScriptedResult| script.iter().filter(|(r, _)| *r == kind).count();
+        let results: Vec<fixture::ScriptedResult> =
+            script.values().flatten().map(|&(r, _)| r).collect();
+        let count = |kind: fixture::ScriptedResult| results.iter().filter(|&&r| r == kind).count();
         let (connects, resets) = (
             count(fixture::ScriptedResult::Connect),
             count(fixture::ScriptedResult::Reset),
@@ -239,7 +373,7 @@ async fn run_scenario(scenario: &fixture::Scenario) {
         urls.push(if resets > 0 {
             assert_eq!(
                 resets,
-                script.len(),
+                results.len(),
                 "{name}: a resetting endpoint only resets"
             );
             resetting_endpoint(index, Break::AfterRequestHead, log.clone()).await
@@ -248,7 +382,7 @@ async fn run_scenario(scenario: &fixture::Scenario) {
         } else {
             assert_eq!(
                 connects,
-                script.len(),
+                results.len(),
                 "{name}: a dead endpoint only refuses"
             );
             let refused = refused::Refused::bind();
@@ -258,10 +392,10 @@ async fn run_scenario(scenario: &fixture::Scenario) {
         });
     }
 
-    let recorder = Recorder::default();
+    let everyone = Recorder::default();
     let mut builder = ServiceClient::builder(urls[0].clone())
         .failover_endpoints(urls[1..].iter().cloned())
-        .retry_observer(recorder.clone());
+        .retry_observer(everyone.clone());
     if let Some(policy) = &scenario.policy {
         builder = builder.retry(policy.to_policy());
     }
@@ -270,70 +404,58 @@ async fn run_scenario(scenario: &fixture::Scenario) {
     }
     let client = builder.build().unwrap();
     assert_eq!(client.endpoints().len(), scenario.endpoints, "{name}");
+    let request = Arc::new(scenario.request.clone());
+
+    if scenario.concurrent {
+        assert!(
+            scenario
+                .calls
+                .iter()
+                .all(|c| c.preferred_before == preferred(&client)),
+            "{name}: concurrent calls must all start where the client does"
+        );
+        let mut set = tokio::task::JoinSet::new();
+        for n in 0..scenario.calls.len() {
+            let (client, request) = (client.clone(), request.clone());
+            set.spawn(async move { (n, send_call(client, request, n).await) });
+        }
+        let mut runs: Vec<Option<CallRun>> = scenario.calls.iter().map(|_| None).collect();
+        while let Some(joined) = set.join_next().await {
+            let (n, run) = joined.unwrap();
+            runs[n] = Some(run);
+        }
+        let arrivals = log.lock().unwrap().clone();
+        for (n, (call, run)) in scenario.calls.iter().zip(runs).enumerate() {
+            let ctx = format!("{name} call {n} (concurrent)");
+            check_call(&client, &ctx, n, call, run.unwrap(), &arrivals);
+            assert_eq!(preferred(&client), call.preferred_after, "{ctx}");
+        }
+        assert_eq!(
+            tally(fixture_observed(&client, everyone.take())),
+            tally(
+                scenario
+                    .calls
+                    .iter()
+                    .flat_map(|c| c.observed.iter().copied())
+            ),
+            "{name}: the client's observer hears the union of every call's reports"
+        );
+        return;
+    }
 
     for (n, call) in scenario.calls.iter().enumerate() {
         let ctx = format!("{name} call {n}");
         assert_eq!(preferred(&client), call.preferred_before, "{ctx}");
         log.lock().unwrap().clear();
-        recorder.take();
-
-        let method = Method::from_bytes(scenario.request.method.as_bytes()).unwrap();
-        let mut request = client
-            .request(method, "fixture")
-            .retriable(scenario.request.retriable);
-        for &code in &scenario.request.retry_on_status {
-            request = request.retry_on_status(fixture::status(code));
-        }
-        for &code in &scenario.request.accept_status {
-            request = request.accept_status(fixture::status(code));
-        }
-        let started = Instant::now();
-        let result = request.send().await;
-        let elapsed = started.elapsed();
-
-        assert_eq!(observed(&client, result), call.outcome, "{ctx}");
-        let reached: Vec<usize> = call
-            .attempts
-            .iter()
-            .filter(|a| a.result != fixture::ScriptedResult::Connect)
-            .map(|a| a.endpoint)
-            .collect();
+        let run = send_call(client.clone(), request.clone(), n).await;
+        let arrivals = log.lock().unwrap().clone();
+        check_call(&client, &ctx, n, call, run, &arrivals);
         assert_eq!(
-            *log.lock().unwrap(),
-            reached,
-            "{ctx}: requests that reached a server"
+            fixture_observed(&client, everyone.take()),
+            call.observed,
+            "{ctx}: the client's observer"
         );
-        let seen: Vec<fixture::Observed> = recorder
-            .take()
-            .into_iter()
-            .map(|seen| match seen {
-                Seen::Rotation(left, reason) => fixture::Observed::Rotation {
-                    left: index_of(&client, &left),
-                    reason: fixture::Reason::from_label(reason.label()),
-                },
-                Seen::Retry(endpoint, reason, attempt) => fixture::Observed::Retry {
-                    endpoint: index_of(&client, &endpoint),
-                    reason: fixture::Reason::from_label(reason.label()),
-                    attempt,
-                },
-            })
-            .collect();
-        assert_eq!(seen, call.observed, "{ctx}");
         assert_eq!(preferred(&client), call.preferred_after, "{ctx}");
-        if call.draws.is_empty() {
-            let paused: u64 = call
-                .attempts
-                .iter()
-                .filter_map(|a| match a.next {
-                    Some(fixture::NextStep::After { pause_ms }) => Some(pause_ms),
-                    _ => None,
-                })
-                .sum();
-            assert!(
-                elapsed >= Duration::from_millis(paused),
-                "{ctx}: {elapsed:?} < {paused}ms of pauses"
-            );
-        }
     }
 }
 
@@ -343,6 +465,26 @@ async fn fixture_scenarios_over_real_http() {
     assert!(!fixture.scenarios.is_empty());
     for scenario in &fixture.scenarios {
         run_scenario(scenario).await;
+    }
+}
+
+/// Concurrent calls on one client, on worker threads so their attempts truly
+/// interleave: each request's own observer hears exactly its own re-sends,
+/// in order, and the client's observer hears their union.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_requests_each_hear_only_their_own_resends() {
+    let fixture = fixture::load();
+    let concurrent: Vec<_> = fixture.scenarios.iter().filter(|s| s.concurrent).collect();
+    assert!(!concurrent.is_empty(), "the fixture pins a concurrent row");
+    for scenario in concurrent {
+        assert!(
+            scenario.calls.iter().any(|c| !c.observed.is_empty()),
+            "{}: a concurrent row must have re-sends to tell apart",
+            scenario.name
+        );
+        for _ in 0..10 {
+            run_scenario(scenario).await;
+        }
     }
 }
 
@@ -647,7 +789,7 @@ async fn reset_is_never_a_connect_failure(at: Break, body: Vec<u8>) {
     assert!(err.failover_trace().is_none(), "{at:?}");
     assert_eq!(
         *log.lock().unwrap(),
-        vec![0],
+        vec![(0, 0)],
         "{at:?}: one attempt reached it"
     );
     assert_eq!(
@@ -684,7 +826,7 @@ async fn single_endpoint_client_reports_every_resend_as_a_retry() {
     let log: Log = Arc::default();
     let only = scripted_endpoint(
         0,
-        vec![(status(503), 1), (status(421), 1), (status(200), 1)],
+        one_call(vec![(status(503), 1), (status(421), 1), (status(200), 1)]),
         log.clone(),
     )
     .await;
@@ -704,7 +846,7 @@ async fn single_endpoint_client_reports_every_resend_as_a_retry() {
         .unwrap();
 
     assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(*log.lock().unwrap(), vec![0, 0, 0]);
+    assert_eq!(*log.lock().unwrap(), vec![(0, 0); 3]);
     let origin = client.endpoints()[0].clone();
     assert_eq!(
         recorder.take(),

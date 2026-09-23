@@ -276,9 +276,17 @@ match client
   `acton_service::observability::get_meter()` as
   `acton_service_client.endpoint.rotations{reason}` and
   `acton_service_client.endpoint.retries{reason}`, with `reason.label()`.
-  The observer runs on the caller's task and reports every attempt but the
-  last, in order, with its outcome; the call's result is the last. That is the
-  complete per-attempt record of a call, on the success path too.
+  The observer runs synchronously on the caller's task.
+- **Per request.** `RequestBuilder::retry_observer` installs an observer on
+  one request, called in addition to the client's (the client's first). A
+  request's observer hears exactly that request's re-sends, every attempt but
+  the last, in order, with its outcome; the request's result is the last.
+  That is the complete per-attempt record of one call, on the success path
+  and under concurrency. The client's observer hears the union of every
+  request's re-sends: in order within each request, with no order promised
+  across concurrent requests, which is right for counters and wrong for
+  deciding what happened to one call. To derive a per-call answer (such as
+  "not submitted anywhere"), install a fresh collector on that request.
 - **Parity.** `spec/fixtures/endpoint-failover-v1.json` pins the rules for
   every port; the Rust crate runs it on a virtual clock and over real HTTP.
 
