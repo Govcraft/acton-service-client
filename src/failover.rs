@@ -285,7 +285,7 @@ impl fmt::Display for EndpointOrigin {
 /// processed the request, and a patch release must not change what an
 /// existing single-endpoint caller sees. Treat that error as ambiguous: re-send
 /// the operation with the same idempotency identity, as a caller that owns
-/// the operation's semantics (for example the Axorum SDK) already does.
+/// the operation's semantics (for example an SDK built on this crate) already does.
 ///
 /// # Examples
 ///

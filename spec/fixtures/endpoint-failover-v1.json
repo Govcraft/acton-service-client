@@ -1,6 +1,6 @@
 {
   "about": {
-    "summary": "Canonical cross-language fixture for acton-service-client endpoint failover (crate 0.2.1). Every client that mirrors the failover behaviour (the Rust crate, and the TypeScript port in AxorumHQ/axorum) must reproduce every row. Consumers vendor a copy; this file is the source of truth.",
+    "summary": "Canonical cross-language fixture for acton-service-client endpoint failover (crate 0.2.1). Every client that mirrors the failover behaviour (the Rust crate, and any port to another language) must reproduce every row. Consumers vendor a copy; this file is the source of truth.",
     "version": 1,
     "units": "Durations are whole milliseconds (_ms) or whole seconds (_s, Retry-After only).",
     "reason_shape": "A rotation reason / attempt outcome is {\"kind\":\"status\",\"status\":N} | {\"kind\":\"connect\"} | {\"kind\":\"timeout\"}.",
