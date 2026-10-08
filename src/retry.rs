@@ -11,13 +11,47 @@
 //! - [`RetryPolicy::backoff_delay`] is the exponential ceiling for a pause.
 //! - [`RetryPolicy::pause`] applies [`Jitter`] under that ceiling and refuses a
 //!   pause that would reach the deadline.
+//! - [`wants_retry`] says whether a response that is not a success asks for
+//!   another attempt, from its status and its `Retry-After`
+//!   ([`parse_retry_after_value`]).
+//! - [`RetryPolicy::next_pause`] is the pause before that attempt, or the
+//!   decision to stop.
 //!
 //! The only randomness (the `draw` fed to [`RetryPolicy::pause`]) and the only
 //! sleeping happen in the client's send loop.
+//!
+//! # Without the client
+//!
+//! This module is the whole crate when its default `transport` feature is off,
+//! and none of it reads a clock: the caller passes the time remaining before
+//! its deadline. A caller that does its own sending, such as a sans-IO state
+//! machine built for `wasm32-unknown-unknown`, gets the same decision the
+//! client's send loop makes for one endpoint:
+//!
+//! ```
+//! use acton_service_client::StatusCode;
+//! use acton_service_client::retry::{RetryPolicy, parse_retry_after_value, wants_retry};
+//! use std::time::Duration;
+//!
+//! let policy = RetryPolicy::default().deadline(Duration::from_secs(10));
+//! // Attempt 1 came back 503 with `Retry-After: 2`, 3 seconds into the call.
+//! let (attempt, status, header) = (1, StatusCode::SERVICE_UNAVAILABLE, Some("2"));
+//! let remaining = policy.deadline.map(|d| d.saturating_sub(Duration::from_secs(3)));
+//!
+//! let retry_after = header.and_then(parse_retry_after_value);
+//! assert!(wants_retry(status, retry_after, false, &[]));
+//! let draw = 0.5; // a uniform sample in [0, 1), used only under Jitter::Full
+//! assert_eq!(
+//!     policy.next_pause(attempt, draw, retry_after, remaining),
+//!     Some(Duration::from_secs(2)),
+//! );
+//! ```
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
+#[cfg(feature = "transport")]
+use std::time::Instant;
 
-use reqwest::Method;
+use http::{Method, StatusCode};
 
 /// How a retry pause is spread below its exponential ceiling.
 ///
@@ -418,17 +452,42 @@ impl RetryPolicy {
         attempt < self.max_attempts.max(1)
     }
 
-    /// The pause before the attempt after `attempt`, or `None` to stop.
+    /// The pause before the attempt after `attempt` (1-based), or `None` to
+    /// stop, for a response that [`wants_retry`].
     ///
     /// Stops when `max_attempts` is spent or when the pause would reach the
-    /// deadline. A server `Retry-After` replaces the computed pause (unjittered,
-    /// uncapped, as in 0.1) but is still refused if it would reach the deadline.
+    /// deadline. A server `Retry-After` (`retry_after`, as
+    /// [`parse_retry_after_value`] reads it) replaces the computed
+    /// [`pause`](Self::pause): unjittered and uncapped, as in 0.1, but still
+    /// refused if it would reach the deadline. `draw` and `remaining` are as
+    /// for [`pause`](Self::pause).
     ///
-    /// This is 0.2.0's single-endpoint decision, kept as the oracle the
-    /// failover state machine is tested against: with one endpoint it must
-    /// decide exactly this.
-    #[cfg(test)]
-    pub(crate) fn next_pause(
+    /// This is the client's decision for a single endpoint, and the failover
+    /// state machine is tested against it: with one endpoint it decides
+    /// exactly this. A caller that does its own sending uses it to retry by
+    /// the client's rules.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use acton_service_client::RetryPolicy;
+    /// use std::time::Duration;
+    ///
+    /// let ms = Duration::from_millis;
+    /// let p = RetryPolicy::with_max_attempts(3)
+    ///     .base_delay(ms(100))
+    ///     .max_delay(ms(1000));
+    /// // Backoff, then the attempts run out.
+    /// assert_eq!(p.next_pause(1, 0.0, None, None), Some(ms(100)));
+    /// assert_eq!(p.next_pause(2, 0.0, None, None), Some(ms(200)));
+    /// assert_eq!(p.next_pause(3, 0.0, None, None), None);
+    /// // Retry-After wins over backoff, uncapped by max_delay...
+    /// assert_eq!(p.next_pause(1, 0.0, Some(ms(5000)), None), Some(ms(5000)));
+    /// // ...unless it would reach the deadline.
+    /// assert_eq!(p.next_pause(1, 0.0, Some(ms(5000)), Some(ms(5000))), None);
+    /// ```
+    #[must_use]
+    pub fn next_pause(
         &self,
         attempt: u32,
         draw: f64,
@@ -483,6 +542,7 @@ pub(crate) fn fits_before(pause: Duration, remaining: Option<Duration>) -> Optio
 
 /// Time left before `deadline` as seen at `now`: `None` without a deadline,
 /// zero once it has passed.
+#[cfg(feature = "transport")]
 pub(crate) fn remaining_until(deadline: Option<Instant>, now: Instant) -> Option<Duration> {
     deadline.map(|at| at.saturating_duration_since(now))
 }
@@ -501,6 +561,7 @@ pub(crate) fn remaining_until(deadline: Option<Instant>, now: Instant) -> Option
 ///
 /// With no deadline and neither of the first two, the request carries no
 /// timeout of its own, exactly as in 0.1.
+#[cfg(feature = "transport")]
 pub(crate) fn attempt_timeout(
     request: Option<Duration>,
     client_attempt: Option<Duration>,
@@ -514,24 +575,96 @@ pub(crate) fn attempt_timeout(
     }
 }
 
-/// Whether a non-success `status` asks for another attempt.
+/// Whether a response that is not a success asks for another attempt: the
+/// client's send loop retries it exactly when this holds.
 ///
-/// An explicit per-request `retry_on` status always does (it is checked before
-/// the accepted list). Otherwise an accepted status is returned as-is, and any
-/// other status is retried when it is retriable by default (see
-/// [`ApiError::is_retriable`](crate::ApiError::is_retriable)).
+/// - `retry_after` is the response's `Retry-After` as
+///   [`parse_retry_after_value`] reads it, `None` when it has none.
+/// - `accepted` is whether the caller takes `status` as an answer rather than
+///   an error (the client's `accept_status`).
+/// - `retry_on` lists statuses the caller retries besides the defaults (the
+///   client's `retry_on_status`).
 ///
-/// This is 0.2.0's rule, kept as the oracle for the failover classification:
-/// a status is retried (rotated or retried in place) exactly when this holds.
-#[cfg(test)]
-pub(crate) fn wants_retry(
-    status: reqwest::StatusCode,
+/// A status in `retry_on` is always retried, accepted or not. Otherwise an
+/// accepted status is not, and any other is retried when it is retriable by
+/// default: `429`, `502`, `503` and `504`, and `423` only with a
+/// `Retry-After`. A caller with no lists of its own passes `false, &[]`.
+///
+/// Whether retries apply to the request at all is the caller's to know: the
+/// client retries only under a [`RetryPolicy`], and only an idempotent method
+/// ([`is_idempotent`]) or a request marked retriable.
+///
+/// # Examples
+///
+/// ```
+/// use acton_service_client::StatusCode;
+/// use acton_service_client::retry::wants_retry;
+/// use std::time::Duration;
+///
+/// assert!(wants_retry(StatusCode::SERVICE_UNAVAILABLE, None, false, &[]));
+/// assert!(!wants_retry(StatusCode::NOT_FOUND, None, false, &[]));
+/// // 423 is retried only when the server says when.
+/// assert!(!wants_retry(StatusCode::LOCKED, None, false, &[]));
+/// assert!(wants_retry(StatusCode::LOCKED, Some(Duration::from_secs(1)), false, &[]));
+/// // An accepted status is an answer, unless it is also listed for retry.
+/// assert!(!wants_retry(StatusCode::SERVICE_UNAVAILABLE, None, true, &[]));
+/// let listed = [StatusCode::MISDIRECTED_REQUEST];
+/// assert!(wants_retry(StatusCode::MISDIRECTED_REQUEST, None, false, &listed));
+/// ```
+#[must_use]
+pub fn wants_retry(
+    status: StatusCode,
     retry_after: Option<Duration>,
     accepted: bool,
-    retry_on: &[reqwest::StatusCode],
+    retry_on: &[StatusCode],
 ) -> bool {
-    retry_on.contains(&status)
-        || (!accepted && crate::error::status_is_retriable(status, retry_after))
+    retry_on.contains(&status) || (!accepted && status_is_retriable(status, retry_after))
+}
+
+/// The retriable-by-default rule, behind [`wants_retry`] and the client's
+/// `ApiError::is_retriable`, as a pure function of the status and any
+/// `Retry-After`, so the send loop can apply it before (or without) reading
+/// the response body.
+pub(crate) fn status_is_retriable(status: StatusCode, retry_after: Option<Duration>) -> bool {
+    match status {
+        StatusCode::TOO_MANY_REQUESTS
+        | StatusCode::BAD_GATEWAY
+        | StatusCode::SERVICE_UNAVAILABLE
+        | StatusCode::GATEWAY_TIMEOUT => true,
+        StatusCode::LOCKED => retry_after.is_some(),
+        _ => false,
+    }
+}
+
+/// The delay a `Retry-After` header value asks for, read as the client reads
+/// it.
+///
+/// Only delta-seconds are recognized: a whole number of seconds, with any
+/// spaces or tabs around it. An HTTP-date, a fraction, a negative number or
+/// anything else yields `None`, so the response counts as having no
+/// `Retry-After`. For every value, this agrees with the client reading the
+/// same bytes from a response header.
+///
+/// # Examples
+///
+/// ```
+/// use acton_service_client::retry::parse_retry_after_value;
+/// use std::time::Duration;
+///
+/// assert_eq!(parse_retry_after_value("30"), Some(Duration::from_secs(30)));
+/// assert_eq!(parse_retry_after_value(" 7\t"), Some(Duration::from_secs(7)));
+/// assert_eq!(parse_retry_after_value("Wed, 21 Oct 2026 07:28:00 GMT"), None);
+/// assert_eq!(parse_retry_after_value("1.5"), None);
+/// ```
+#[must_use]
+pub fn parse_retry_after_value(value: &str) -> Option<Duration> {
+    // A header value the client can read as text holds only visible ASCII,
+    // spaces and tabs, so spaces and tabs are all the whitespace it can trim.
+    value
+        .trim_matches([' ', '\t'])
+        .parse::<u64>()
+        .ok()
+        .map(Duration::from_secs)
 }
 
 /// Whether an HTTP method is idempotent and therefore safe to retry by default.
@@ -542,8 +675,8 @@ pub(crate) fn wants_retry(
 /// # Examples
 ///
 /// ```
+/// use acton_service_client::Method;
 /// use acton_service_client::retry::is_idempotent;
-/// use reqwest::Method;
 ///
 /// assert!(is_idempotent(&Method::GET));
 /// assert!(is_idempotent(&Method::PUT));
@@ -560,9 +693,10 @@ pub fn is_idempotent(method: &Method) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::error::build_api_error;
-    use reqwest::StatusCode;
-    use reqwest::header::HeaderMap;
+    #[cfg(feature = "transport")]
+    use crate::error::{build_api_error, parse_retry_after};
+    #[cfg(feature = "transport")]
+    use http::header::{HeaderMap, HeaderValue};
 
     fn ms(n: u64) -> Duration {
         Duration::from_millis(n)
@@ -748,6 +882,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "transport")]
     #[test]
     fn remaining_until_saturates_at_zero() {
         let now = Instant::now();
@@ -761,6 +896,7 @@ mod tests {
 
     /// The full precedence table: request > client attempt > builder >
     /// remaining, every level clamped to the remaining budget.
+    #[cfg(feature = "transport")]
     #[test]
     fn attempt_timeout_precedence_table() {
         let s = Duration::from_secs;
@@ -842,7 +978,9 @@ mod tests {
     }
 
     /// Defaults must reproduce 0.1.2 exactly: same retriable statuses, same
-    /// pauses (Retry-After included), same attempt count, no per-request timeout.
+    /// pauses (Retry-After included), same attempt count. The last 0.1.2
+    /// default, no per-request timeout, is a row of
+    /// `attempt_timeout_precedence_table`.
     #[test]
     fn defaults_reproduce_the_0_1_2_schedule() {
         let p = RetryPolicy::default();
@@ -875,28 +1013,112 @@ mod tests {
         // Both directions over 100..600: every status 0.1.2 retried is
         // retried, and every status it did not retry is not. An accepted
         // status is never retried (0.1.2 returned it before looking).
-        let mut with_retry_after = HeaderMap::new();
-        with_retry_after.insert("retry-after", "30".parse().unwrap());
         let mut retried = 0;
         for code in 100..600u16 {
             let status = StatusCode::from_u16(code).unwrap();
-            for headers in [HeaderMap::new(), with_retry_after.clone()] {
-                let api = build_api_error(status, &headers, "");
-                let then = retriable_in_0_1_2(status, headers.contains_key("retry-after"));
-                let now = wants_retry(status, api.retry_after, false, &[]);
-                assert_eq!(now, then, "{status} retry-after={:?}", api.retry_after);
-                assert_eq!(api.is_retriable(), then, "{status}");
-                assert!(!wants_retry(status, api.retry_after, true, &[]), "{status}");
+            for header in [None, Some("30")] {
+                let retry_after = header.and_then(parse_retry_after_value);
+                let then = retriable_in_0_1_2(status, header.is_some());
+                let now = wants_retry(status, retry_after, false, &[]);
+                assert_eq!(now, then, "{status} retry-after={retry_after:?}");
+                assert!(!wants_retry(status, retry_after, true, &[]), "{status}");
                 retried += usize::from(now);
             }
         }
         // 429/502/503/504 with and without Retry-After, 423 only with it.
         assert_eq!(retried, 4 * 2 + 1);
-        // No override, no attempt_timeout, no deadline: no per-request timeout.
-        assert_eq!(
-            attempt_timeout(None, None, Some(Duration::from_secs(30)), None),
-            None
-        );
+    }
+
+    /// `ApiError::is_retriable` is `wants_retry` for a request with no lists of
+    /// its own, over every status, with and without a `Retry-After`.
+    #[cfg(feature = "transport")]
+    #[test]
+    fn api_error_is_retriable_is_wants_retry() {
+        let mut with_retry_after = HeaderMap::new();
+        with_retry_after.insert("retry-after", HeaderValue::from_static("30"));
+        for code in 100..600u16 {
+            let status = StatusCode::from_u16(code).unwrap();
+            for headers in [HeaderMap::new(), with_retry_after.clone()] {
+                let api = build_api_error(status, &headers, "");
+                assert_eq!(
+                    api.is_retriable(),
+                    wants_retry(status, api.retry_after, false, &[]),
+                    "{status}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn retry_after_values() {
+        let s = Duration::from_secs;
+        for (value, expected) in [
+            ("0", Some(s(0))),
+            ("30", Some(s(30))),
+            (" 30", Some(s(30))),
+            ("30 ", Some(s(30))),
+            ("\t 30 \t", Some(s(30))),
+            ("+30", Some(s(30))),
+            ("030", Some(s(30))),
+            ("18446744073709551615", Some(s(u64::MAX))),
+            ("18446744073709551616", None),
+            ("", None),
+            ("  ", None),
+            ("-1", None),
+            ("1.5", None),
+            ("30s", None),
+            ("3 0", None),
+            ("Wed, 21 Oct 2026 07:28:00 GMT", None),
+            ("\u{a0}30", None),
+            ("30\n", None),
+        ] {
+            assert_eq!(parse_retry_after_value(value), expected, "{value:?}");
+        }
+    }
+
+    /// The 0.2.1 `Retry-After` reading, copied verbatim, as an independent
+    /// oracle: a header the client can read as text, trimmed, as delta-seconds.
+    #[cfg(feature = "transport")]
+    fn retry_after_in_0_2_1(headers: &HeaderMap) -> Option<Duration> {
+        headers
+            .get("Retry-After")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .map(Duration::from_secs)
+    }
+
+    /// For every byte before, after, or inside a delay, the client reads the
+    /// header as 0.2.1 did, and `parse_retry_after_value` reads the same bytes
+    /// the same way, whether a caller holds them as UTF-8 or (as a browser's
+    /// `fetch` hands them over) as one character per byte.
+    #[cfg(feature = "transport")]
+    #[test]
+    fn a_retry_after_value_reads_as_the_header_does() {
+        let mut checked = 0;
+        for byte in 0..=u8::MAX {
+            for bytes in [
+                vec![byte, b'3', b'0'],
+                vec![b'3', b'0', byte],
+                vec![b'3', byte, b'0'],
+                vec![byte],
+            ] {
+                let Ok(value) = HeaderValue::from_bytes(&bytes) else {
+                    continue;
+                };
+                let mut headers = HeaderMap::new();
+                headers.insert("retry-after", value);
+                let expected = retry_after_in_0_2_1(&headers);
+                assert_eq!(parse_retry_after(&headers), expected, "{bytes:?}");
+                let per_byte: String = bytes.iter().map(|&b| char::from(b)).collect();
+                assert_eq!(parse_retry_after_value(&per_byte), expected, "{bytes:?}");
+                if let Ok(utf8) = std::str::from_utf8(&bytes) {
+                    assert_eq!(parse_retry_after_value(utf8), expected, "{bytes:?}");
+                }
+                checked += 1;
+            }
+        }
+        // Every byte but the 31 controls other than tab, and DEL, can be sent.
+        assert_eq!(checked, (256 - 32) * 4);
     }
 
     #[test]

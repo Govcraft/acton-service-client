@@ -1,0 +1,128 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# A new push to a pull request supersedes its previous run.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+  clippy:
+    name: clippy (${{ matrix.name }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: default
+            args: --all-targets
+          - name: policy-only
+            args: --all-targets --no-default-features
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: clippy-${{ matrix.name }}
+      - name: Clippy (${{ matrix.name }})
+        run: cargo clippy ${{ matrix.args }} -- -D warnings
+
+  test:
+    name: tests (${{ matrix.name }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: default
+            args: ""
+          - name: policy-only
+            args: --no-default-features
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: test-${{ matrix.name }}
+      - name: Unit and integration tests (${{ matrix.name }})
+        run: cargo nextest run ${{ matrix.args }}
+      # nextest does not run doctests. The crate-level examples drive the
+      # client, so the doctests run with the default features.
+      - name: Doctests
+        if: matrix.name == 'default'
+        run: cargo test --doc
+
+  rustdoc:
+    name: rustdoc
+    runs-on: ubuntu-latest
+    env:
+      RUSTDOCFLAGS: -D warnings
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: rustdoc
+      - name: Build docs
+        run: cargo doc --no-deps
+
+  # A sans-IO caller in a browser builds the retry policy for
+  # wasm32-unknown-unknown, without the HTTP client. That target has no
+  # operating system, so a dependency that cannot compile there fails this job
+  # before it reaches a consumer. Reading the clock compiles there and panics
+  # only when run, so the guard against the policy reading one is
+  # `tests/policy_only.rs`, which the policy-only test job runs.
+  wasm32:
+    name: wasm32 (policy-only)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: wasm32
+      - name: Build for wasm32-unknown-unknown
+        run: cargo build --no-default-features --target wasm32-unknown-unknown

@@ -126,45 +126,83 @@
 //! the builder expects. [`bearer_token`](ServiceClientBuilder::bearer_token)
 //! and [`default_header`](ServiceClientBuilder::default_header) are sent
 //! per-request, so they keep working with a supplied client.
+//!
+//! # Cargo features
+//!
+//! - **`transport`** (default): the HTTP client and everything it sends and
+//!   reads: [`ServiceClient`], [`RequestBuilder`], endpoint failover, the
+//!   error, health, versioning and request-tracking types, and the
+//!   [`reqwest`] re-export. It brings in `reqwest` and `tokio`.
+//!
+//! With `default-features = false` the crate is the [`retry`] module alone:
+//! [`RetryPolicy`], [`Jitter`], [`retry::is_idempotent`], and the decision the
+//! client's send loop makes about a response that is not a success
+//! ([`retry::parse_retry_after_value`], [`retry::wants_retry`],
+//! [`RetryPolicy::next_pause`]), plus the [`Method`] and [`StatusCode`] types
+//! they take. None of it sends, reads a clock or draws randomness: the caller
+//! supplies the time remaining and the jitter draw. It builds for
+//! `wasm32-unknown-unknown`, so a sans-IO caller that does its own sending,
+//! such as a state machine in a browser, retries by exactly the client's
+//! rules.
+//!
+//! ```toml
+//! [dependencies]
+//! acton-service-client = { version = "0.3", default-features = false }
+//! ```
 
 #![deny(missing_docs)]
 #![deny(rustdoc::broken_intra_doc_links)]
 #![warn(clippy::all)]
 
+#[cfg(feature = "transport")]
 pub mod context;
+#[cfg(feature = "transport")]
 pub mod error;
+#[cfg(feature = "transport")]
 pub mod failover;
+#[cfg(feature = "transport")]
 pub mod health;
 pub mod retry;
+#[cfg(feature = "transport")]
 pub mod url;
+#[cfg(feature = "transport")]
 pub mod versioning;
 
+#[cfg(feature = "transport")]
 mod client;
+#[cfg(feature = "transport")]
 mod request;
 
 // Lets the fixture model shared with the integration tests name this crate.
 #[cfg(test)]
 extern crate self as acton_service_client;
 
+#[cfg(feature = "transport")]
 pub use client::{ServiceClient, ServiceClientBuilder};
+#[cfg(feature = "transport")]
 pub use context::{
     PROPAGATED_HEADERS, RequestContext, X_CLIENT_ID, X_CORRELATION_ID, X_REQUEST_ID, X_SPAN_ID,
     X_TRACE_ID,
 };
+#[cfg(feature = "transport")]
 pub use error::{ApiError, ClientError, ErrorResponse, RateLimitInfo};
+#[cfg(feature = "transport")]
 pub use failover::{
     AttemptTrace, Endpoint, EndpointOrigin, EndpointSetError, FailoverTrace, RetryObserver,
     RetryReason, TracedAttempt,
 };
+#[cfg(feature = "transport")]
 pub use health::{DependencyStatus, HealthResponse, ReadinessResponse};
+#[cfg(feature = "transport")]
 pub use request::RequestBuilder;
 pub use retry::{Jitter, RetryPolicy};
+#[cfg(feature = "transport")]
 pub use versioning::ApiVersion;
 
-/// Re-export of `reqwest`'s `Method` for convenience.
-pub use reqwest::Method;
-/// Re-export of `reqwest`'s `StatusCode` for convenience.
-pub use reqwest::StatusCode;
+/// Re-export of the `http` crate's `Method`, the type `reqwest` uses.
+pub use http::Method;
+/// Re-export of the `http` crate's `StatusCode`, the type `reqwest` uses.
+pub use http::StatusCode;
 
 /// Re-export of the `reqwest` crate.
 ///
@@ -172,4 +210,5 @@ pub use reqwest::StatusCode;
 /// custom root store, or a proxy — and hand it to
 /// [`ServiceClientBuilder::with_http_client`] without risking a version
 /// mismatch on the `reqwest::Client` type.
+#[cfg(feature = "transport")]
 pub use reqwest;

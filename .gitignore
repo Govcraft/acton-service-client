@@ -1,6 +1,7 @@
-# Hidden files and directories (except .gitignore)
+# Hidden files and directories (except .gitignore and the CI workflows)
 .*
 !.gitignore
+!.github/
 
 # Rust
 target/

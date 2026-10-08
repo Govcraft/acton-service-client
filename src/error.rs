@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
 use crate::failover::{EndpointSetError, FailoverTrace};
+use crate::retry::{parse_retry_after_value, status_is_retriable};
 
 /// Header name for the rate-limit ceiling.
 pub const RATELIMIT_LIMIT: &str = "RateLimit-Limit";
@@ -149,20 +150,6 @@ impl ApiError {
     #[must_use]
     pub fn is_retriable(&self) -> bool {
         status_is_retriable(self.status, self.retry_after)
-    }
-}
-
-/// The retriable-by-default rule behind [`ApiError::is_retriable`], as a pure
-/// function of the status and any `Retry-After`, so the retry loop can apply
-/// it before (or without) reading the response body.
-pub(crate) fn status_is_retriable(status: StatusCode, retry_after: Option<Duration>) -> bool {
-    match status {
-        StatusCode::TOO_MANY_REQUESTS
-        | StatusCode::BAD_GATEWAY
-        | StatusCode::SERVICE_UNAVAILABLE
-        | StatusCode::GATEWAY_TIMEOUT => true,
-        StatusCode::LOCKED => retry_after.is_some(),
-        _ => false,
     }
 }
 
@@ -451,6 +438,8 @@ pub fn parse_rate_limit(headers: &HeaderMap) -> Option<RateLimitInfo> {
 /// Parse a `Retry-After` header expressed in delta-seconds.
 ///
 /// Only the numeric (seconds) form is recognized; HTTP-date forms yield `None`.
+/// A header holding anything but visible ASCII, spaces and tabs yields `None`;
+/// any other value reads as [`parse_retry_after_value`] reads it.
 ///
 /// # Examples
 ///
@@ -465,7 +454,10 @@ pub fn parse_rate_limit(headers: &HeaderMap) -> Option<RateLimitInfo> {
 /// ```
 #[must_use]
 pub fn parse_retry_after(headers: &HeaderMap) -> Option<Duration> {
-    parse_u64_header(headers, RETRY_AFTER).map(Duration::from_secs)
+    headers
+        .get(RETRY_AFTER)
+        .and_then(|v| v.to_str().ok())
+        .and_then(parse_retry_after_value)
 }
 
 /// Build an [`ApiError`] from a failing response's status, headers, and raw body.

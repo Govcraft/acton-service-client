@@ -46,8 +46,8 @@ use std::time::Duration;
 
 use reqwest::StatusCode;
 
-use crate::error::{ClientError, status_is_retriable};
-use crate::retry::{RetryPolicy, fits_before};
+use crate::error::ClientError;
+use crate::retry::{RetryPolicy, fits_before, status_is_retriable};
 
 /// One endpoint to add to a client's failover set.
 ///

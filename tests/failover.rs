@@ -2,6 +2,9 @@
 //! `spec/fixtures/endpoint-failover-v1.json` against scripted axum servers,
 //! plus the redirect, per-endpoint client, and expired-deadline guarantees.
 
+// These run the HTTP client, which the default `transport` feature builds.
+#![cfg(feature = "transport")]
+
 #[path = "support/failover_fixture.rs"]
 mod fixture;
 #[path = "support/refused.rs"]

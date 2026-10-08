@@ -14,6 +14,9 @@
 //! environment-sensitive for proving wire-shape mirroring. Every JSON body and
 //! header below is byte-for-byte what `acton-service` emits.
 
+// These run the HTTP client, which the default `transport` feature builds.
+#![cfg(feature = "transport")]
+
 #[path = "support/refused.rs"]
 mod refused;
 
