@@ -309,17 +309,56 @@ A client with one endpoint behaves exactly as 0.2.0.
 | Tracking | `RequestContext` for the five propagation headers; auto `x-request-id` (UUID v4) |
 | Rate limits | `RateLimitInfo` surfaced on `ApiError` |
 | Auth | Bearer tokens (JWT or PASETO, opaque to the client) |
-| Retries | Opt-in `RetryPolicy`: pure backoff math, floored jitter, total deadline, per-request extra statuses and timeouts |
+| Retries | Opt-in `RetryPolicy`: pure backoff math, floored jitter, total deadline, per-request extra statuses and timeouts; usable alone, without `transport` |
 | Failover | Ordered endpoint set under one deadline: validated at build, sticky, in-set redirects only, typed trace on exhaustion, retry observer |
+
+## Retry policy without the client
+
+The default `transport` feature holds the HTTP client. Without it, the crate
+is the `retry` module alone: it depends only on `http`, sends nothing, reads
+no clock and draws no randomness, and builds for `wasm32-unknown-unknown`. A
+caller that does its own sending, such as a sans-IO state machine in a
+browser, retries by the client's rules:
+
+```toml
+[dependencies]
+acton-service-client = { version = "0.3", default-features = false }
+```
+
+```rust
+use acton_service_client::StatusCode;
+use acton_service_client::retry::{RetryPolicy, parse_retry_after_value, wants_retry};
+use std::time::Duration;
+
+let policy = RetryPolicy::default().deadline(Duration::from_secs(10));
+// Attempt 1 answered 503 with `Retry-After: 2`, 3 seconds into the call.
+let retry_after = parse_retry_after_value("2");
+if wants_retry(StatusCode::SERVICE_UNAVAILABLE, retry_after, false, &[]) {
+    let remaining = Some(Duration::from_secs(7));
+    let draw = 0.5; // uniform in [0, 1), used only under Jitter::Full
+    match policy.next_pause(1, draw, retry_after, remaining) {
+        Some(pause) => { /* send attempt 2 after `pause` */ }
+        None => { /* stop: return this response */ }
+    }
+}
+```
+
+`wants_retry` and `RetryPolicy::next_pause` are the decisions the client's
+send loop makes for one endpoint. Retries apply only under a policy, and only
+to an idempotent method (`retry::is_idempotent`) or a request the caller marks
+retriable.
 
 ## Development
 
 ```sh
 cargo fmt --all
 cargo clippy --all-targets -- -D warnings   # zero warnings
+cargo clippy --all-targets --no-default-features -- -D warnings
 cargo nextest run                           # unit + integration
+cargo nextest run --no-default-features     # the retry policy alone
 cargo test --doc                            # doctests
 cargo doc --no-deps                         # warning-free
+cargo build --no-default-features --target wasm32-unknown-unknown
 ```
 
 Integration tests exercise a real HTTP round-trip against an ephemeral

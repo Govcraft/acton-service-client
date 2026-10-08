@@ -5,7 +5,51 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.2.1] - Unreleased
+## [0.3.0] - Unreleased
+
+### Added
+
+- **The retry policy without the HTTP client.** A default feature,
+  `transport`, now holds the client and everything it sends and reads. With
+  `default-features = false` the crate is the `retry` module alone, which
+  depends only on `http`, sends nothing, reads no clock and draws no
+  randomness, and builds for `wasm32-unknown-unknown`. A caller that does its
+  own sending, such as a sans-IO state machine in a browser, makes the same
+  decision the client's send loop makes for one endpoint:
+  - `retry::parse_retry_after_value(&str)`: a `Retry-After` header value read
+    as the client reads it (delta-seconds only), agreeing with the client on
+    every byte sequence.
+  - `retry::wants_retry(status, retry_after, accepted, retry_on)`: whether a
+    response that is not a success asks for another attempt. This is the
+    client's rule, previously internal: a status in `retry_on` always, else an
+    unaccepted `429`, `502`, `503`, `504`, or `423` with a `Retry-After`.
+  - `RetryPolicy::next_pause(attempt, draw, retry_after, remaining)`: the pause
+    before the next attempt, or `None` to stop. A `Retry-After` replaces the
+    backoff unless it would reach the deadline, and `max_attempts` is
+    respected. The caller passes the time remaining, so no clock is read.
+  - `retry::is_idempotent`, `RetryPolicy`, `Jitter`, and the `Method` and
+    `StatusCode` re-exports, as before.
+
+### Changed
+
+- **Breaking:** every item outside `retry` (the client, requests, failover,
+  and the error, health, versioning, URL and request-tracking types), the
+  `reqwest` re-export, and the `reqwest`, `tokio`, `serde`, `serde_json`,
+  `thiserror`, `url`, `uuid` and `fastrand` dependencies now require the
+  `transport` feature. It is on by default, so a build that keeps default
+  features is unchanged.
+- The `Method` and `StatusCode` re-exports now name the `http` crate's types.
+  They are the same types `reqwest` re-exports, so nothing changes for a
+  caller.
+
+### Migration
+
+- A build with default features needs no change.
+- A dependency declared with `default-features = false` (which had no effect
+  before) now gets only the retry policy. Add `features = ["transport"]` to
+  keep the client.
+
+## [0.2.1] - 2026-09-23
 
 ### Added
 

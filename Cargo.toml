@@ -1,6 +1,6 @@
 [package]
 name = "acton-service-client"
-version = "0.2.1"
+version = "0.3.0"
 edition = "2024"
 license = "MIT"
 description = "Typed async HTTP client for services built on the acton-service framework. Encodes acton-service's fixed wire conventions (error bodies, versioned routes, health/readiness, request-tracking headers, rate limiting) so consumers don't reinvent them."
@@ -10,15 +10,34 @@ readme = "README.md"
 keywords = ["http", "client", "reqwest", "api", "acton-service"]
 categories = ["web-programming::http-client", "network-programming", "asynchronous"]
 
+[features]
+default = ["transport"]
+# The HTTP client: `ServiceClient`, its requests, endpoint failover, and the
+# wire types it sends and reads. Without it the crate is the retry policy
+# alone (`retry`), which sends nothing, reads no clock and draws no
+# randomness, so it builds for wasm32-unknown-unknown and suits a sans-IO
+# caller that does its own sending.
+transport = [
+    "dep:fastrand",
+    "dep:reqwest",
+    "dep:serde",
+    "dep:serde_json",
+    "dep:thiserror",
+    "dep:tokio",
+    "dep:url",
+    "dep:uuid",
+]
+
 [dependencies]
-fastrand = "2.5.0"
-reqwest = { version = "0.13.4", default-features = false, features = ["rustls", "json", "query"] }
-serde = { version = "1.0.228", features = ["derive"] }
-serde_json = "1.0.150"
-thiserror = "2.0.18"
-tokio = { version = "1.52.3", features = ["time"] }
-url = "2.5.8"
-uuid = { version = "1.23.4", features = ["v4"] }
+fastrand = { version = "2.5.0", optional = true }
+http = "1.5.0"
+reqwest = { version = "0.13.4", default-features = false, features = ["rustls", "json", "query"], optional = true }
+serde = { version = "1.0.228", features = ["derive"], optional = true }
+serde_json = { version = "1.0.150", optional = true }
+thiserror = { version = "2.0.18", optional = true }
+tokio = { version = "1.52.3", features = ["time"], optional = true }
+url = { version = "2.5.8", optional = true }
+uuid = { version = "1.23.4", features = ["v4"], optional = true }
 
 [dev-dependencies]
 axum = "0.8.9"
